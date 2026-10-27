@@ -61,8 +61,8 @@ from typing import (
 
 import sympy as sp
 
-from .core.core import FluxomicsData, LabelingExperiments
-from .io import format_conventions as conv
+from ..core.core import FluxomicsData, LabelingExperiments
+from ..io import format_conventions as conv
 
 KINDS: Tuple[str, ...] = (
     "metabolite",

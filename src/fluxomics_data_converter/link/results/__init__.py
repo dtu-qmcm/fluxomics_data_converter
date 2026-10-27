@@ -16,22 +16,21 @@ Each reader turns what one tool emits after a run into a ``fluxolink``
 
 The FreeFlux and x3cflux readers are duck-typed: neither package is
 imported. :func:`wrap_in_dataset` places a run in a minimal catalog-tier
-``FluxoDataset`` and :func:`dump_dataset` writes it for
-``fluxolink-validate``.
+record; :func:`~fluxomics_data_converter.link.add_results` adds it to an
+existing one.
 
 These functions need the optional ``linkml`` extra (``fluxolink``).
 """
 
 from __future__ import annotations
 
-from ._common import dump_dataset, wrap_in_dataset
+from ._common import wrap_in_dataset
 from .freeflux import from_freeflux_result
 from .inca import read_inca_results
 from .influx_si import parse_influx_log, read_influx_si_results, read_miso_sim
 from .x3cflux import from_x3cflux_fit
 
 __all__ = [
-    "dump_dataset",
     "from_freeflux_result",
     "from_x3cflux_fit",
     "parse_influx_log",

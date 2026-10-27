@@ -1,16 +1,16 @@
 """Fluxomics I/O operations package.
 
-Contains parsers and writers for the fluxomics data formats:
+Contains parsers and writers for the input formats of the 13C-MFA tools:
 
 - **FluxML** — hierarchical XML format used by 13CFlux/13CFlux2
 - **MTF** — multi-file text format used by influx_si
 - **Freeflux** — tabular format (tsv/csv/xlsx) used by Freeflux
 - **INCA** — MATLAB model scripts (``.m``) used by INCA (read-only)
-- **FluxoLink** — LinkML dataset YAML (``.yaml``); needs the optional
-  ``linkml`` extra (``uv sync --extra linkml``)
 
-:mod:`.results` reads what the tools write after a run (influx_si, INCA,
-FreeFlux, 13CFLUX v3) into FluxoLink records; it also needs the extra.
+Every format translates through
+:class:`~fluxomics_data_converter.FluxomicsData`, so any parser can feed
+any writer directly. FluxoLink records are not a format here: they link
+these files together and live in :mod:`fluxomics_data_converter.link`.
 
 Quick start
 -----------
@@ -21,7 +21,6 @@ Auto-detect format from file extension and parse::
     model = parse("models/ecoli.netw")         # MTF  (pass the .netw file)
     model = parse("models/reactions.tsv")      # Freeflux (pass reactions file)
     model = parse("models/EC.m")               # INCA
-    model = parse("study/ec.yaml")             # FluxoLink dataset
 
 Or use format-specific convenience functions::
 
@@ -56,19 +55,6 @@ from .freeflux_parser import FreefluxParser, parse_freeflux
 from .freeflux_writer import FreefluxWriter, write_freeflux
 from .inca_parser import INCAParser, parse_inca
 
-# FluxoLink names, imported on first use because they need the optional
-# ``fluxolink`` package: name -> defining module
-_FLUXOLINK = {
-    "FluxoLinkParser": "fluxolink_parser",
-    "parse_fluxolink": "fluxolink_parser",
-    "from_fluxo_dataset": "fluxolink_parser",
-    "load_yaml": "fluxolink_parser",
-    "FluxoLinkWriter": "fluxolink_writer",
-    "write_fluxolink": "fluxolink_writer",
-    "to_fluxo_dataset": "fluxolink_writer",
-    "dump_yaml": "fluxolink_writer",
-}
-
 # Extension → parser class mapping used by parse()
 _PARSERS: dict[str, type] = {
     ".fml": FluxMLParser,
@@ -79,35 +65,6 @@ _PARSERS: dict[str, type] = {
     ".xlsx": FreefluxParser,
     ".m": INCAParser,
 }
-# Extension → name of a parser in _FLUXOLINK
-_LAZY_PARSERS: dict[str, str] = {
-    ".yaml": "FluxoLinkParser",
-    ".yml": "FluxoLinkParser",
-}
-
-
-def __getattr__(name: str):
-    """Import the FluxoLink parser and writer on first use.
-
-    Returns:
-        The requested class or function.
-
-    Raises:
-        ImportError: If the optional ``fluxolink`` package is missing.
-        AttributeError: If *name* is not exported.
-    """
-    if name not in _FLUXOLINK:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    try:
-        import fluxolink  # noqa: F401
-    except ImportError as error:  # pragma: no cover - depends on env
-        raise ImportError(
-            f"{name} needs the optional 'fluxolink' package; install the "
-            "converter with the 'linkml' extra (uv sync --extra linkml)"
-        ) from error
-    from importlib import import_module
-
-    return getattr(import_module(f".{_FLUXOLINK[name]}", __name__), name)
 
 
 def parse(path: str | Path):
@@ -124,8 +81,6 @@ def parse(path: str | Path):
       (pass the ``reactions.*`` file or the directory containing it)
     - ``.m``                           → :class:`INCAParser`
       (an INCA MATLAB model script; read-only)
-    - ``.yaml`` / ``.yml``             → :class:`FluxoLinkParser`
-      (a FluxoLink dataset; needs the ``linkml`` extra)
 
     Args:
         path: Path to the model file (or base path for multi-file formats).
@@ -143,15 +98,12 @@ def parse(path: str | Path):
         model = parse("data/ecoli.netw")
         model = parse("data/reactions.tsv")
         model = parse("data/EC.m")
-        model = parse("study/ec.yaml")
     """
     path = Path(path)
     suffix = path.suffix.lower()
     parser_cls = _PARSERS.get(suffix)
-    if parser_cls is None and suffix in _LAZY_PARSERS:
-        parser_cls = __getattr__(_LAZY_PARSERS[suffix])
     if parser_cls is None:
-        supported = sorted([*_PARSERS, *_LAZY_PARSERS])
+        supported = sorted(_PARSERS)
         raise ValueError(
             f"Unrecognised file extension '{path.suffix}'. "
             f"Supported extensions: {supported}"

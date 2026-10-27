@@ -2,7 +2,7 @@
 
 Entry point::
 
-    from fluxomics_data_converter.io.results import read_inca_results
+    from fluxomics_data_converter.link.results import read_inca_results
     run = read_inca_results(Path("model.mat"), mc_path=Path("model_mc.mat"))
 
 An INCA results file is a MATLAB v5 file with the fit ``f``, the model ``m``

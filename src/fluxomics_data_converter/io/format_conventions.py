@@ -1,6 +1,6 @@
-"""Format conventions shared by the FluxoLink parser/writer and equivalence.
+"""Format conventions shared by the tool readers/writers and the link layer.
 
-Nothing here imports :mod:`fluxolink`, so the equivalence diff can use these
+Nothing here imports :mod:`fluxolink`, so the equivalence check can use these
 helpers without the optional ``linkml`` extra installed.
 
 The helpers answer questions every converter consumer has to answer the same

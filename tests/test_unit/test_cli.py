@@ -1,5 +1,7 @@
 """Tests for the ``fluxo`` command-line interface."""
 
+import re
+import shutil
 from pathlib import Path
 
 import pytest
@@ -18,6 +20,7 @@ EC_FML = DATA / "benchmark" / "FluxML" / "EC.fml"
 SIMPLE_MTF = DATA / "simple_model" / "MTF" / "simple_model.netw"
 SIMPLE_RES = DATA / "simple_model" / "MTF" / "simple_model_res"
 ROUNDTRIP = DATA / "simple_model" / "roundtrip_test"
+FF_TOY = DATA / "freeflux_tests" / "toy"
 
 
 def _filled_sidecar(tmp_path: Path) -> Path:
@@ -171,6 +174,72 @@ def test_compare_inputs_and_export(
     )
     assert code == 0
     assert (tmp_path / "mtf" / "EC.netw").exists()
+    doc = yaml.safe_load(out.read_text())
+    (check,) = doc["equivalence_checks"]
+    paths = {f["id"]: f["path"] for f in doc["source_files"]}
+    assert "mtf/EC.netw" in {paths[i] for i in check["files"]}
     fml = tmp_path / "EC_rt.fml"
     assert main(["export", str(out), "--to", "fluxml", "-o", str(fml)]) == 0
     assert fml.read_text().lstrip().startswith("<?xml")
+
+
+def test_convert_links_inputs_and_results(tmp_path: Path) -> None:
+    work = tmp_path / "src"
+    shutil.copytree(SIMPLE_MTF.parent, work)
+    record = tmp_path / "simple.yaml"
+    convert = [
+        "convert",
+        str(work / "simple_model.netw"),
+        "--to",
+        "fluxml",
+        "freeflux",
+        "-o",
+        str(tmp_path / "runs"),
+        "--link",
+        str(record),
+    ]
+    assert main(convert) == 0
+    doc = yaml.safe_load(record.read_text())
+    generated = [f for f in doc["source_files"] if f.get("generated_by")]
+    assert {Path(f["path"]).parts[1] for f in generated} == {
+        "fluxml",
+        "freeflux",
+    }
+    sources = {f["id"] for f in doc["source_files"]} - {
+        f["id"] for f in generated
+    }
+    assert all(set(f["derived_from"]) == sources for f in generated)
+    assert len(doc["equivalence_checks"]) == 2
+
+    assert (
+        main(["add-results", str(record), str(work / "simple_model_res")]) == 0
+    )
+    doc = yaml.safe_load(record.read_text())
+    (done,) = [r for r in doc["simulation_runs"] if r.get("flux_solution")]
+    assert done["software"]["software_name"] == "influx_si"
+    assert done["output_files"]
+
+    # converting again reuses the recorded source instead of adding it twice
+    assert main(convert) == 0
+    again = yaml.safe_load(record.read_text())
+    assert len(again["source_files"]) == len(doc["source_files"])
+
+
+def test_add_input_records_aliases(tmp_path: Path) -> None:
+    source = tmp_path / "toy"
+    shutil.copytree(FF_TOY, source)
+    (source / "measured_inst_MDVs.tsv").unlink()
+    record = tmp_path / "toy.yaml"
+    assert main(["ingest", str(source), "-o", str(record)]) == 0
+
+    renamed = tmp_path / "renamed"
+    shutil.copytree(source, renamed)
+    for table in renamed.glob("*.tsv"):
+        text = table.read_text()
+        table.write_text(re.sub(r"^v3\t", "glu_synthesis\t", text, flags=re.M))
+    assert main(["add-input", str(record), str(renamed)]) == 0
+    doc = yaml.safe_load(record.read_text())
+    (v3,) = [r for r in doc["networks"][0]["reactions"] if r["id"] == "v3"]
+    assert v3["aliases"] == ["freeflux:glu_synthesis"]
+    checks = {c["id"]: c for c in doc["equivalence_checks"]}
+    assert any(c["equivalent"] for c in checks.values())

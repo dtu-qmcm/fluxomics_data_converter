@@ -23,10 +23,8 @@ import math
 import re
 import warnings
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Iterable, Optional, Tuple
 
-import yaml
 from fluxolink.datamodel import fluxolink as fl
 
 _NA_STRINGS = frozenset({"", "na", "nan", "null", "none", "n/a", "-"})
@@ -473,34 +471,3 @@ def wrap_in_dataset(
         "simulation_runs": [run],
     }
     return fl.FluxoDataset(**compact(fields))
-
-
-def dataset_document(ds: fl.FluxoDataset) -> dict[str, Any]:
-    """Return a dataset as a plain, JSON-compatible dictionary.
-
-    Args:
-        ds: The dataset.
-
-    Returns:
-        The document with unset and ``None`` slots left out.
-    """
-    return ds.model_dump(mode="json", exclude_unset=True, exclude_none=True)
-
-
-def dump_dataset(ds: fl.FluxoDataset, path: Path | str) -> Path:
-    """Write a dataset as YAML (for ``fluxolink-validate``).
-
-    Args:
-        ds: The dataset.
-        path: Output file; parent directories are created.
-
-    Returns:
-        The path written.
-    """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    text = yaml.safe_dump(
-        dataset_document(ds), sort_keys=False, allow_unicode=True, width=88
-    )
-    path.write_text(text, encoding="utf-8")
-    return path

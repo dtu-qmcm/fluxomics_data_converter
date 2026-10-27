@@ -2,7 +2,7 @@
 
 Entry point::
 
-    from fluxomics_data_converter.io.results import (
+    from fluxomics_data_converter.link.results import (
         read_influx_si_results,
     )
     run = read_influx_si_results(Path("simple_model/MTF/simple_model_res"))

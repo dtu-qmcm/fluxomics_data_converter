@@ -1,4 +1,4 @@
-"""Tests for the FluxoLink adapter (materialise, hydrate, equivalence).
+"""Tests for the record's model copy (model <-> record) and equivalence.
 
 Skipped as a whole when the optional ``linkml`` extra (``fluxolink``) is
 not installed.
@@ -35,15 +35,15 @@ from fluxomics_data_converter.experiment.tracer import (  # noqa: E402
     LabelComposition,
     Tracers,
 )
-from fluxomics_data_converter.equivalence import (  # noqa: E402
+from fluxomics_data_converter.link import (  # noqa: E402
+    from_fluxo_dataset,
+    load_record,
+    save_record,
+    to_fluxo_dataset,
+)
+from fluxomics_data_converter.link.equivalence import (  # noqa: E402
     canonical_constraint,
     compare,
-)
-from fluxomics_data_converter.io import (  # noqa: E402
-    dump_yaml,
-    from_fluxo_dataset,
-    load_yaml,
-    to_fluxo_dataset,
 )
 from fluxomics_data_converter.io import (  # noqa: E402
     parse_fluxml_file,
@@ -107,8 +107,8 @@ def _round_trip(data, tmp_path, name, source_path):
         source_path=source_path,
         data_origin="synthetic",
     )
-    path = dump_yaml(ds, tmp_path / f"{name}.yaml")
-    reloaded = load_yaml(path)
+    path = save_record(ds, tmp_path / f"{name}.yaml")
+    reloaded = load_record(path)
     assert isinstance(reloaded, fl.FluxoDataset)
     return ds, from_fluxo_dataset(reloaded)
 
@@ -317,7 +317,7 @@ def test_ec_dataset_content(ec):
 
 def test_dump_omits_schema_defaults(ec, tmp_path):
     ds = _quiet(to_fluxo_dataset, ec, dataset_id="ec", source_path=EC_FML)
-    text = dump_yaml(ds, tmp_path / "ec.yaml", header="EC").read_text()
+    text = save_record(ds, tmp_path / "ec.yaml", header="EC").read_text()
     assert text.startswith("# EC\n")
     assert "is_pseudo" not in text and "instance: 1\n" not in text
     doc = yaml.safe_load(text)
@@ -335,7 +335,7 @@ def test_ec_dataset_validates(ec, tmp_path):
         data_origin="synthetic",
         metadata=EC_SIDECAR,
     )
-    path = dump_yaml(ds, tmp_path / "ec_fluxml_benchmark.yaml")
+    path = save_record(ds, tmp_path / "ec_fluxml_benchmark.yaml")
     cli = shutil.which("linkml-validate") or str(
         Path(sys.executable).parent / "linkml-validate"
     )

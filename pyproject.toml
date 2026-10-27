@@ -25,7 +25,7 @@ license = {text = "MIT"}
 fluxo = "fluxomics_data_converter.cli:main"
 
 [project.optional-dependencies]
-# FluxoLink (LinkML) datasets: io.fluxolink_parser/_writer, io.results, the fluxo CLI
+# FluxoLink records (fluxomics_data_converter.link) and the fluxo CLI
 linkml = ["fluxolink"]
 
 [tool.uv.sources]

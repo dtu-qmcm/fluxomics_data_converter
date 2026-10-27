@@ -1,10 +1,10 @@
 """Rebuild a converter model from a FluxoLink ``FluxoDataset``.
 
 :func:`from_fluxo_dataset` is the inverse of
-:func:`~.fluxolink_writer.to_fluxo_dataset`, so the FluxML, MTF and FreeFlux
-writers can be driven from a dataset::
+:func:`~.record_from_model.to_fluxo_dataset`, so the FluxML, MTF and
+FreeFlux writers can be driven from a record::
 
-    ds = load_yaml("ec.yaml")
+    ds = load_record("ec.yaml")
     data = from_fluxo_dataset(ds)
     write_fluxml(data, "ec_roundtrip.fml")
 
@@ -35,10 +35,8 @@ Normalisation contract
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import yaml
 from fluxolink.datamodel import fluxolink as fl
 
 from ..core.common import Annotation, DictList, ErrorModel, TextualOrMath
@@ -78,7 +76,7 @@ from ..output.simulation import (
     Simulation,
     Variables,
 )
-from . import format_conventions as conv
+from ..io import format_conventions as conv
 
 _STATE_SPACES = {
     "auto": "auto",
@@ -831,57 +829,3 @@ def _pool_value(
         type=code,
         edweight=row.ed_weight if row.ed_weight is not None else 1.0,
     )
-
-
-def load_yaml(path: Path | str) -> fl.FluxoDataset:
-    """Load a FluxoLink YAML document into the Pydantic classes.
-
-    Args:
-        path: The YAML file.
-
-    Returns:
-        The validated dataset.
-    """
-    with open(path, encoding="utf-8") as handle:
-        return fl.FluxoDataset.model_validate(yaml.safe_load(handle))
-
-
-class FluxoLinkParser:
-    """Parser for FluxoLink dataset YAML files (``.yaml`` / ``.yml``).
-
-    Satisfies :class:`~fluxomics_data_converter.io.base.FluxomicsParser`.
-    """
-
-    def __init__(self, network_id: Optional[str] = None):
-        """Initialise the parser.
-
-        Args:
-            network_id: Network to read when the dataset holds several.
-        """
-        self.network_id = network_id
-
-    def parse(self, path: Path | str) -> FluxomicsData:
-        """Read a FluxoLink dataset and convert it into a converter model.
-
-        Args:
-            path: The dataset YAML file.
-
-        Returns:
-            The converter model.
-        """
-        return from_fluxo_dataset(load_yaml(path), network_id=self.network_id)
-
-
-def parse_fluxolink(
-    path: Path | str, network_id: Optional[str] = None
-) -> FluxomicsData:
-    """Convenience function to parse a FluxoLink dataset YAML file.
-
-    Args:
-        path: The dataset YAML file.
-        network_id: Network to read when the dataset holds several.
-
-    Returns:
-        The converter model.
-    """
-    return FluxoLinkParser(network_id=network_id).parse(path)

@@ -1,16 +1,24 @@
-"""Command-line interface ``fluxo``: ingest, validate, compare and export.
+"""Command-line interface ``fluxo``: translate tool inputs and link them.
 
-One install, a handful of commands (FluxoLink PATH_FORWARD §12)::
+Translating needs no record::
+
+    fluxo convert EC.fml --to mtf freeflux -o runs/
+
+A FluxoLink record (``ec.yaml``) ties one study's tool files together: the
+reference model, every tool input with its checksum and equivalence check,
+id aliases, and each tool's results::
 
     fluxo meta init EC.fml -o study.yaml
     fluxo ingest EC.fml --meta study.yaml --tier benchmark -o ec.yaml
-    fluxo ingest model.netw --results model_res -o run1.yaml
+    fluxo convert EC.fml --to mtf freeflux -o runs/ --link ec.yaml
+    fluxo add-input ec.yaml my_EC.netw --experiment a_STAT
+    fluxo add-results ec.yaml runs/mtf/EC_a_STAT_res --tool influx_si
+    fluxo export ec.yaml --to fluxml -o runs/fluxml/EC.fml
     fluxo validate ec.yaml --benchmark
-    fluxo compare run1.yaml run2.yaml
+    fluxo compare ec.yaml
     fluxo compare a.yaml b.yaml --inputs
-    fluxo export ec.yaml --to mtf -o out/EC
 
-Every command that writes a dataset validates it first (LinkML schema plus
+Every command that writes a record validates it first (LinkML schema plus
 the semantic and tier checks of ``fluxolink-validate``) and refuses to write
 a document with errors unless ``--force`` is given.
 """
@@ -28,6 +36,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 FORMATS = ("fluxml", "mtf", "freeflux", "inca")
+WRITABLE = ("fluxml", "mtf", "freeflux")
 
 # Sidecar keys handled here rather than by to_fluxo_dataset.
 _CLI_SIDECAR_KEYS = ("data_origin",)
@@ -42,11 +51,11 @@ _REQUIRED_CONDITION = (
 
 
 def detect_format(path: Path, fmt: str | None) -> str:
-    """Return the converter format key for an input path.
+    """Return the tool key of an input path.
 
     Args:
         path: Input file, MTF prefix/.netw, or FreeFlux directory.
-        fmt: Explicit format, overriding detection.
+        fmt: Explicit tool key, overriding detection.
 
     Returns:
         One of ``FORMATS``.
@@ -54,26 +63,12 @@ def detect_format(path: Path, fmt: str | None) -> str:
     Raises:
         SystemExit: If the format cannot be determined.
     """
-    if fmt:
-        return fmt
-    if path.is_dir():
-        return "freeflux"
-    suffix = path.suffix.lower()
-    by_suffix = {
-        ".fml": "fluxml",
-        ".xml": "fluxml",
-        ".netw": "mtf",
-        ".tsv": "freeflux",
-        ".xlsx": "freeflux",
-        ".m": "inca",
-    }
-    if suffix in by_suffix:
-        return by_suffix[suffix]
-    if path.with_suffix(".netw").exists():
-        return "mtf"
-    raise SystemExit(
-        f"cannot detect the format of {path}; pass --format {'|'.join(FORMATS)}"
-    )
+    from fluxomics_data_converter.link.tool_inputs import detect_tool
+
+    try:
+        return detect_tool(path, fmt)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
 
 
 def parse_native(path: Path, fmt: str) -> Any:
@@ -86,16 +81,9 @@ def parse_native(path: Path, fmt: str) -> Any:
     Returns:
         The parsed ``FluxomicsData``.
     """
-    from fluxomics_data_converter import io
+    from fluxomics_data_converter.link.tool_inputs import read_tool_input
 
-    if fmt == "fluxml":
-        return io.parse_fluxml_file(str(path))
-    if fmt == "mtf":
-        prefix = path.with_suffix("") if path.suffix == ".netw" else path
-        return io.parse_mtf(str(prefix))
-    if fmt == "freeflux":
-        return io.parse_freeflux(str(path if path.is_dir() else path.parent))
-    return io.parse_inca(str(path))
+    return read_tool_input(path, fmt)
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -107,10 +95,10 @@ def _load_yaml(path: Path) -> dict[str, Any]:
 
 
 def _write_yaml(doc: dict[str, Any], path: Path, header: str | None) -> None:
-    from fluxomics_data_converter.io.fluxolink_writer import to_yaml_text
+    from fluxomics_data_converter.link.record import record_text
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(to_yaml_text(doc, header), encoding="utf-8")
+    path.write_text(record_text(doc, header), encoding="utf-8")
 
 
 def _report(doc: dict[str, Any], *, benchmark: bool | None, label: str) -> bool:
@@ -221,7 +209,7 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     Returns:
         Exit code.
     """
-    from fluxomics_data_converter.io.fluxolink_writer import to_fluxo_dataset
+    from fluxomics_data_converter.link import to_fluxo_dataset
 
     source = Path(args.input)
     fmt = detect_format(source, args.format)
@@ -239,7 +227,11 @@ def cmd_ingest(args: argparse.Namespace) -> int:
             dataset_type=args.tier,
             data_origin=data_origin,
             metadata=metadata,
-            source_root=Path(args.source_root) if args.source_root else None,
+            source_root=(
+                Path(args.source_root)
+                if args.source_root
+                else _record_root(Path(args.output))
+            ),
         )
     except (ValueError, TypeError) as error:
         print(f"cannot build the dataset: {error}", file=sys.stderr)
@@ -297,13 +289,13 @@ def read_results(path: Path, kind: str | None, source: Path) -> dict[str, Any]:
     """
     kind = kind or ("inca" if path.suffix == ".mat" else "influx_si")
     if kind == "influx_si":
-        from fluxomics_data_converter.io.results.influx_si import (
+        from fluxomics_data_converter.link.results.influx_si import (
             read_influx_si_results,
         )
 
         run = read_influx_si_results(path, input_dir=source.parent)
     elif kind == "inca":
-        from fluxomics_data_converter.io.results.inca import (
+        from fluxomics_data_converter.link.results.inca import (
             read_inca_results,
         )
 
@@ -349,17 +341,14 @@ def _flux_columns(
 
 
 def _alias_map(doc: dict[str, Any]) -> dict[str, str]:
-    """Map tool-native reaction ids (from aliases) to canonical ids.
+    """Map tool-native ids (from the record's aliases) to canonical ids.
 
     Returns:
-        Native id to canonical reaction id.
+        Native id to canonical id.
     """
-    mapping: dict[str, str] = {}
-    for net in doc.get("networks") or []:
-        for rxn in net.get("reactions") or []:
-            for alias in rxn.get("aliases") or []:
-                mapping[alias.split(":", 1)[1]] = rxn["id"]
-    return mapping
+    from fluxomics_data_converter.link.aliases import alias_map
+
+    return alias_map(doc)
 
 
 def _cell(res: dict[str, Any] | None) -> str:
@@ -382,7 +371,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
         return _compare_inputs(docs, args)
     merged: dict[tuple[str, str], dict[str, dict[str, Any]]] = {}
     for label, doc in docs:
-        aliases = _alias_map(doc) if args.use_aliases else {}
+        aliases = _alias_map(doc)
         for key, cols in _flux_columns(doc, label, aliases).items():
             merged.setdefault(key, {}).update(cols)
     columns = sorted({c for cols in merged.values() for c in cols})
@@ -410,8 +399,7 @@ def _compare_inputs(
 ) -> int:
     from fluxolink.datamodel.fluxolink import FluxoDataset
 
-    from fluxomics_data_converter.equivalence import compare
-    from fluxomics_data_converter.io.fluxolink_parser import from_fluxo_dataset
+    from fluxomics_data_converter.link import compare, from_fluxo_dataset
 
     if len(docs) != 2:
         print("--inputs compares exactly two datasets", file=sys.stderr)
@@ -424,38 +412,277 @@ def _compare_inputs(
     return 0 if report.equivalent else 1
 
 
-def cmd_export(args: argparse.Namespace) -> int:
-    """Write a tool's native input files from a dataset.
+def _record_root(record: Path) -> Path:
+    return record.resolve().parent
+
+
+def _save_record(ds: Any, record: Path, header: str, force: bool) -> int:
+    """Validate a record and write it unless it has errors.
 
     Returns:
         Exit code.
     """
-    from fluxolink.datamodel.fluxolink import FluxoDataset
+    from fluxomics_data_converter.link import record_document
 
-    from fluxomics_data_converter import io
-    from fluxomics_data_converter.io.fluxolink_parser import from_fluxo_dataset
-
-    doc = _load_yaml(Path(args.dataset))
-    data = from_fluxo_dataset(
-        FluxoDataset.model_validate(doc), network_id=args.network
-    )
-    out = Path(args.output)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    if args.to == "fluxml":
-        io.write_fluxml(data, str(out))
-    else:
-        names = [exp.name for exp in data.experiments]
-        if len(names) > 1 and not args.experiment:
-            print(
-                f"{args.to} holds one configuration; choose one with "
-                f"--experiment ({', '.join(names)})",
-                file=sys.stderr,
-            )
-            return 1
-        writer = io.write_mtf if args.to == "mtf" else io.write_freeflux
-        writer(data, str(out), experiment_name=args.experiment)
-    print(f"wrote {args.to} input to {out}")
+    doc = record_document(ds)
+    if not _report(doc, benchmark=None, label=str(record)) and not force:
+        print(
+            f"{record} not updated: fix the errors above or pass --force",
+            file=sys.stderr,
+        )
+        return 1
+    _write_yaml(doc, record, header)
+    print(f"updated {record}")
     return 0
+
+
+def _print_check(ti: Any, check: Any) -> None:
+    status = "same problem" if check.equivalent else "DIFFERS"
+    print(
+        f"  {ti.tool} {ti.path}: {status} "
+        f"({len(check.differences)} difference(s), "
+        f"{len(check.expected_differences)} by design)"
+    )
+    for line in check.differences[:5]:
+        print(f"      {line}")
+    if len(check.differences) > 5:
+        print(f"      ... and {len(check.differences) - 5} more (see record)")
+
+
+def _write_inputs(
+    data: Any, tools: list[str], out: Path, stem: str, experiment: str | None
+) -> list[Any]:
+    """Write each tool's input under ``out/<tool>/``.
+
+    Returns:
+        The written inputs.
+    """
+    from fluxomics_data_converter.link import write_tool_input
+    from fluxomics_data_converter.link.tool_inputs import SINGLE_CONFIGURATION
+
+    names = [e.name for e in data.experiments]
+    written = []
+    for tool in tools:
+        if tool not in SINGLE_CONFIGURATION:
+            target = out / tool / f"{stem}.fml"
+            written.append(
+                write_tool_input(data, tool, target, experiment=experiment)
+            )
+            continue
+        for name in [experiment] if experiment else names or [None]:
+            label = f"{stem}_{name}" if len(names) > 1 else stem
+            target = out / tool / label
+            written.append(
+                write_tool_input(data, tool, target, experiment=name)
+            )
+    for ti in written:
+        print(f"wrote {ti.tool} input: {ti.path}")
+    return written
+
+
+def _register_source(
+    ds: Any, source: Any, root: Path, reference: Any
+) -> tuple[Any, list[str]]:
+    """Make sure the record holds the files a conversion read.
+
+    A source already recorded (same path and checksum) is reused; another
+    one is checked against the record like any hand-written input.
+
+    Returns:
+        The record and the ids of the source's files.
+    """
+    from fluxomics_data_converter.link import (
+        check_tool_input,
+        infer_aliases,
+        record_tool_input,
+    )
+    from fluxomics_data_converter.link.files import file_checksum, record_path
+
+    known = {(f.path, f.checksum): f.id for f in ds.source_files or []}
+    keys = [
+        (record_path(path, root), file_checksum(path))
+        for path, _, _ in source.files()
+    ]
+    if keys and all(k in known for k in keys):
+        return ds, [known[k] for k in keys]
+    match = infer_aliases(reference, source.read())
+    check = check_tool_input(reference, source, id_map=match.id_map)
+    _print_check(source, check)
+    ds = record_tool_input(
+        ds, source, check, root=root, generated=False, aliases=match
+    )
+    known = {(f.path, f.checksum): f.id for f in ds.source_files or []}
+    return ds, [known[k] for k in keys if k in known]
+
+
+def cmd_convert(args: argparse.Namespace) -> int:
+    """Translate a tool input into other tools' inputs; optionally link them.
+
+    Returns:
+        Exit code.
+    """
+    from fluxomics_data_converter.link import (
+        ToolInput,
+        check_tool_input,
+        from_fluxo_dataset,
+        load_record,
+        record_tool_input,
+        to_fluxo_dataset,
+    )
+
+    source = ToolInput.locate(Path(args.input), args.format)
+    data = source.read()
+    stem = source.path.stem if source.path.suffix else source.path.name
+    try:
+        written = _write_inputs(
+            data, args.to, Path(args.output), stem, args.experiment
+        )
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 1
+    if not args.link:
+        return 0
+
+    record = Path(args.link)
+    root = _record_root(record)
+    if record.exists():
+        ds = load_record(record)
+        reference = from_fluxo_dataset(ds)
+        ds, source_ids = _register_source(ds, source, root, reference)
+    else:
+        ds = to_fluxo_dataset(
+            data,
+            dataset_id=args.dataset_id or stem.replace(".", "_"),
+            source_path=source.path,
+            source_format=source.fmt,
+            dataset_type="catalog",
+            data_origin=args.data_origin,
+            source_root=root,
+        )
+        source_ids = [f.id for f in ds.source_files or []]
+        reference = from_fluxo_dataset(ds)
+    print("checking each input against the record:")
+    for ti in written:
+        check = check_tool_input(reference, ti)
+        _print_check(ti, check)
+        ds = record_tool_input(
+            ds, ti, check, root=root, generated=True, derived_from=source_ids
+        )
+    return _save_record(ds, record, f"FluxoLink record for {stem}.", args.force)
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    """Write a tool's input from a record's model and record it there.
+
+    Returns:
+        Exit code.
+    """
+    from fluxomics_data_converter.link import (
+        check_tool_input,
+        from_fluxo_dataset,
+        load_record,
+        record_tool_input,
+        write_tool_input,
+    )
+
+    record = Path(args.dataset)
+    ds = load_record(record)
+    data = from_fluxo_dataset(ds, network_id=args.network)
+    try:
+        ti = write_tool_input(
+            data, args.to, Path(args.output), experiment=args.experiment
+        )
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 1
+    print(f"wrote {args.to} input to {ti.path}")
+    if args.no_link:
+        return 0
+    check = check_tool_input(data, ti)
+    _print_check(ti, check)
+    ds = record_tool_input(
+        ds,
+        ti,
+        check,
+        root=_record_root(record),
+        generated=True,
+        network_id=args.network,
+    )
+    return _save_record(ds, record, f"FluxoLink record {ds.id}.", args.force)
+
+
+def cmd_add_input(args: argparse.Namespace) -> int:
+    """Check a tool input written elsewhere and add it to a record.
+
+    Returns:
+        Exit code.
+    """
+    from fluxomics_data_converter.link import (
+        ToolInput,
+        check_tool_input,
+        from_fluxo_dataset,
+        infer_aliases,
+        load_record,
+        record_tool_input,
+    )
+
+    record = Path(args.record)
+    ds = load_record(record)
+    reference = from_fluxo_dataset(ds, network_id=args.network)
+    ti = ToolInput.locate(Path(args.input), args.format, args.experiment)
+    match = infer_aliases(reference, ti.read())
+    try:
+        check = check_tool_input(reference, ti, id_map=match.id_map)
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 1
+    _print_check(ti, check)
+    renamed = len(match.metabolites) + len(match.reactions)
+    if renamed:
+        print(f"  {renamed} id(s) differ from the record's; stored as aliases")
+    ds = record_tool_input(
+        ds,
+        ti,
+        check,
+        root=_record_root(record),
+        generated=False,
+        aliases=match,
+        software=args.software,
+        software_version=args.software_version,
+        network_id=args.network,
+    )
+    return _save_record(ds, record, f"FluxoLink record {ds.id}.", args.force)
+
+
+def cmd_add_results(args: argparse.Namespace) -> int:
+    """Read a tool's results and attach them to the record's planned run.
+
+    Returns:
+        Exit code.
+    """
+    from fluxolink.datamodel.fluxolink import SimulationRun
+
+    from fluxomics_data_converter.link import (
+        add_results,
+        load_record,
+        result_files,
+    )
+
+    record = Path(args.record)
+    ds = load_record(record)
+    path = Path(args.results)
+    kind = args.tool or ("inca" if path.suffix == ".mat" else "influx_si")
+    run = SimulationRun.model_validate(read_results(path, kind, path))
+    if args.configuration:
+        run.configuration_name = args.configuration
+    tool = "INCA" if kind == "inca" else "influx_si"
+    ds = add_results(
+        ds,
+        run,
+        output_files=result_files(path, tool),
+        root=_record_root(record),
+    )
+    return _save_record(ds, record, f"FluxoLink record {ds.id}.", args.force)
 
 
 _SIDECAR_TEMPLATE = """\
@@ -544,7 +771,9 @@ def build_parser() -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(
         prog="fluxo",
-        description="Ingest, validate, compare and export FluxoLink datasets.",
+        description=(
+            "Translate 13C-MFA tool inputs and link them in FluxoLink records."
+        ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -571,7 +800,8 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--software", help="tool (default: the format's own)")
     ingest.add_argument("--software-version")
     ingest.add_argument(
-        "--source-root", help="directory SourceFile paths are relative to"
+        "--source-root",
+        help="directory file paths are relative to (default: the record's)",
     )
     ingest.add_argument(
         "--force", action="store_true", help="write despite errors"
@@ -590,7 +820,6 @@ def build_parser() -> argparse.ArgumentParser:
     compare = sub.add_parser("compare", help="compare results or inputs")
     compare.add_argument("files", nargs="+")
     compare.add_argument("--inputs", action="store_true", help="compare inputs")
-    compare.add_argument("--use-aliases", action="store_true")
     compare.add_argument("--rtol", type=float, default=1e-6)
     compare.add_argument("--atol", type=float, default=1e-9)
     compare.add_argument(
@@ -598,11 +827,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     compare.set_defaults(func=cmd_compare)
 
-    export = sub.add_parser("export", help="dataset -> native tool input")
-    export.add_argument("dataset")
-    export.add_argument(
-        "--to", choices=("fluxml", "mtf", "freeflux"), required=True
+    convert = sub.add_parser(
+        "convert", help="tool input -> other tools' inputs (+ record)"
     )
+    convert.add_argument(
+        "input", help=".fml, .netw, FreeFlux dir/table, INCA .m"
+    )
+    convert.add_argument("--format", choices=FORMATS)
+    convert.add_argument("--to", nargs="+", choices=WRITABLE, required=True)
+    convert.add_argument(
+        "-o", "--output", required=True, help="directory; one folder per tool"
+    )
+    convert.add_argument(
+        "--experiment", help="only this configuration (default: all)"
+    )
+    convert.add_argument(
+        "--link", help="record to add the inputs to (created if missing)"
+    )
+    convert.add_argument("--dataset-id", help="id of a new record")
+    convert.add_argument(
+        "--data-origin", choices=("experimental", "synthetic", "simulated")
+    )
+    convert.add_argument(
+        "--force", action="store_true", help="write despite errors"
+    )
+    convert.set_defaults(func=cmd_convert)
+
+    export = sub.add_parser("export", help="record -> tool input (recorded)")
+    export.add_argument("dataset")
+    export.add_argument("--to", choices=WRITABLE, required=True)
     export.add_argument("-o", "--output", required=True)
     export.add_argument(
         "--network", help="network id if the dataset has several"
@@ -611,7 +864,50 @@ def build_parser() -> argparse.ArgumentParser:
         "--experiment",
         help="configuration to write (MTF and FreeFlux hold one)",
     )
+    export.add_argument(
+        "--no-link",
+        action="store_true",
+        help="do not add the written files to the record",
+    )
+    export.add_argument(
+        "--force", action="store_true", help="write despite errors"
+    )
     export.set_defaults(func=cmd_export)
+
+    add_input = sub.add_parser(
+        "add-input", help="check a hand-written tool input, add it to a record"
+    )
+    add_input.add_argument("record")
+    add_input.add_argument("input")
+    add_input.add_argument("--format", choices=FORMATS)
+    add_input.add_argument(
+        "--experiment", help="configuration an MTF/FreeFlux input holds"
+    )
+    add_input.add_argument("--network")
+    add_input.add_argument(
+        "--software", help="tool (default: the format's own)"
+    )
+    add_input.add_argument("--software-version")
+    add_input.add_argument(
+        "--force", action="store_true", help="write despite errors"
+    )
+    add_input.set_defaults(func=cmd_add_input)
+
+    add_res = sub.add_parser(
+        "add-results", help="attach a tool's results to a record"
+    )
+    add_res.add_argument("record")
+    add_res.add_argument(
+        "results", help="influx_si <prefix>_res directory or INCA .mat"
+    )
+    add_res.add_argument("--tool", choices=("influx_si", "inca"))
+    add_res.add_argument(
+        "--configuration", help="configuration the results are for"
+    )
+    add_res.add_argument(
+        "--force", action="store_true", help="write despite errors"
+    )
+    add_res.set_defaults(func=cmd_add_results)
 
     meta = sub.add_parser("meta", help="metadata sidecar helpers")
     meta_sub = meta.add_subparsers(dest="meta_command", required=True)

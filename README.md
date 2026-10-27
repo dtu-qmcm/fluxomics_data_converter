@@ -108,50 +108,52 @@ evaluator = ConstraintEvaluator(reaction_ids, parameters={"mu": 0.03})
 constraint_fn, operator, rhs = evaluator.parse_formula("uptGLC = 1.0")
 ```
 
-## FluxoLink datasets and the `fluxo` CLI
+## Linking tools: FluxoLink records and the `fluxo` CLI
 
-[FluxoLink](../fluxomics_linkml) is the LinkML data model built on the FLUXO
-ontology. The optional `linkml` extra connects the two projects:
-
-- FluxoLink is one more format in `fluxomics_data_converter.io`:
-  `io.fluxolink_writer` turns a parsed model into a dataset YAML and
-  `io.fluxolink_parser` reads it back (`parse("ec.yaml")` works too).
-- `fluxomics_data_converter.io.results` reads tool results into dataset
-  records: influx_si `<prefix>_res/`, INCA `.mat`, and FreeFlux and 13CFLUX v3
-  result objects.
-- `fluxomics_data_converter.equivalence.compare` checks whether two parsed
-  models describe the same 13C-MFA problem, whatever format they came from.
-  It does not need the extra.
+The converter translates directly between tools: any parser feeds any writer
+through `FluxomicsData`. A [FluxoLink](../fluxomics_linkml) record is not one
+more format in that chain. It links one study's tool files together: the
+reference copy of the model, every tool input with its checksum and an
+equivalence check against the reference, the ids each tool uses, and each
+tool's results (see [docs/formats.md](docs/formats.md)). This lives in
+`fluxomics_data_converter.link` and needs the optional `linkml` extra:
 
 ```bash
 uv sync --extra linkml
 ```
 
 ```bash
+fluxo convert EC.fml --to mtf freeflux -o runs/       # translate, nothing else
 fluxo meta init EC.fml -o study.yaml          # scaffold the metadata no native file carries
-fluxo ingest EC.fml --meta study.yaml --tier benchmark -o ec.yaml
-fluxo ingest model.netw --results model_res -o run1.yaml    # influx_si inputs + results
+fluxo ingest EC.fml --meta study.yaml --tier benchmark -o ec.yaml   # start a record
+fluxo convert EC.fml --to mtf freeflux -o runs/ --link ec.yaml      # write + check + record
+fluxo add-input ec.yaml my_EC.netw --experiment a_STAT  # a hand-written input: check + aliases
+fluxo add-results ec.yaml runs/mtf/EC_a_STAT_res        # results into the planned run
+fluxo export ec.yaml --to fluxml -o runs/fluxml/EC.fml  # regenerate an input from the record
 fluxo validate ec.yaml --benchmark            # schema + references + tier rules
-fluxo compare run1.yaml run2.yaml             # flux results side by side, by reaction id
-fluxo compare a.yaml b.yaml --inputs          # do two datasets encode the same problem?
-fluxo export ec.yaml --to mtf --experiment a_STAT -o out/EC   # regenerate tool inputs
+fluxo compare ec.yaml                         # flux results of every run, by canonical id
+fluxo compare a.yaml b.yaml --inputs          # do two records encode the same problem?
 ```
 
-`fluxo ingest` validates the dataset before writing it. At the benchmark tier it
-fails, with a list of the missing fields, until the sidecar supplies what no
-native format carries.
+Every command that writes a record validates it first. At the benchmark tier
+`fluxo ingest` fails, with a list of the missing fields, until the sidecar
+supplies what no native format carries.
 
 ```python
-from fluxomics_data_converter.equivalence import compare
-from fluxomics_data_converter.io import (
-    dump_yaml, from_fluxo_dataset, parse_fluxml_file, to_fluxo_dataset,
+from pathlib import Path
+
+from fluxomics_data_converter.io import parse_fluxml_file
+from fluxomics_data_converter.link import (
+    check_tool_input, record_tool_input, save_record, to_fluxo_dataset,
+    write_tool_input,
 )
 
 model = parse_fluxml_file("EC.fml")
-dataset = to_fluxo_dataset(model, dataset_id="ec", source_path="EC.fml",
-                           data_origin="synthetic")
-dump_yaml(dataset, "ec.yaml")
-assert compare(model, from_fluxo_dataset(dataset)).equivalent
+record = to_fluxo_dataset(model, dataset_id="ec", source_path=Path("EC.fml"))
+mtf = write_tool_input(model, "mtf", Path("runs/EC"), experiment="a_STAT")
+check = check_tool_input(model, mtf)   # parse back; by-design vs real differences
+record = record_tool_input(record, mtf, check, root=Path("."), generated=True)
+save_record(record, "ec.yaml")
 ```
 
 ## Project Structure
@@ -173,12 +175,20 @@ fluxomics_data_converter/
 │   │   └── measurement.py       # Measurement data types
 │   ├── output/                  # Output and simulation structures
 │   │   └── simulation.py        # Simulation settings, variables, bounds
-│   └── io/                      # Input/Output handlers
-│       ├── fluxml_parser.py     # FluxML format parser
-│       ├── fluxml_writer.py     # FluxML format writer
-│       ├── mtf_parser.py        # MTF (influx_si) format parser
-│       ├── mtf_writer.py        # MTF (influx_si) format writer
-│       └── freeflux_parser.py   # Freeflux tabular format parser
+│   ├── io/                      # One reader/writer per tool input format
+│   │   ├── fluxml_parser.py     # FluxML format parser
+│   │   ├── fluxml_writer.py     # FluxML format writer
+│   │   ├── mtf_parser.py        # MTF (influx_si) format parser
+│   │   ├── mtf_writer.py        # MTF (influx_si) format writer
+│   │   ├── freeflux_parser.py   # Freeflux tabular format parser
+│   │   ├── freeflux_writer.py   # Freeflux tabular format writer
+│   │   └── inca_parser.py       # INCA MATLAB model script parser
+│   ├── link/                    # FluxoLink records: tie the tools' files together
+│   │   ├── tool_inputs.py       # write, check and record each tool's input
+│   │   ├── aliases.py           # tool ids <-> canonical ids
+│   │   ├── runs.py, results/    # tool results into the record
+│   │   └── equivalence.py       # do two models describe the same problem?
+│   └── cli.py                   # the `fluxo` command
 ├── tests/                       # Test suite
 │   └── test_unit/               # Unit tests
 ├── data/                        # Example data files

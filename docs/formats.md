@@ -6,7 +6,6 @@
 | MTF | influx_si | ✅ | ✅ | Cumomer, `.mmet`, METAB vars supported |
 | CSV/TSV/XLSX | FreeFlux | ✅ | 🔲 | No tracers/constraints from files |
 | MATLAB `.m` | INCA | ✅ | 🔲 | Model scripts; write not planned |
-| YAML `.yaml` | FluxoLink | ✅ | ✅ | LinkML dataset; needs the `linkml` extra |
 | XML | SBML | 🔲 | 🔲 | Planned (dependency ready) |
 
 ## FluxML
@@ -129,34 +128,57 @@ from fluxomics_data_converter.io import parse_freeflux
 model = parse_freeflux("path/to/freeflux_dir")
 ```
 
-## FluxoLink (LinkML dataset YAML)
+## Linking the formats: FluxoLink records
 
-A [FluxoLink](../../fluxomics_linkml) dataset is the validated, archival
-form of a study: network, tracers, measurements and, unlike the tool
-formats, provenance and results. The converter reads and writes it like
-any other format; the optional `linkml` extra provides the schema
-(`uv sync --extra linkml`).
+FluxoLink is not a format in the table above: no tool reads it, and no
+translation goes through it. Every translation goes straight from one tool's
+file to `FluxomicsData` and on to another tool's file. A
+[FluxoLink](../../fluxomics_linkml) record (YAML) ties one study's files
+together:
 
-```python
-from fluxomics_data_converter.io import parse, parse_fluxml_file, write_fluxolink
+- the reference copy of the model (network, atom maps, tracers,
+  measurements), which every tool input is checked against;
+- every tool input actually used, with its checksum, which file it was
+  generated from (`derived_from`), and the result of checking that it
+  encodes the same problem (`equivalence_checks`);
+- each tool's ids mapped onto the canonical ones (`aliases`);
+- each tool's results, in the run that names its exact input files.
 
-model = parse_fluxml_file("EC.fml")
-write_fluxolink(model, "ec.yaml", source_path="EC.fml", data_origin="synthetic")
-model = parse("ec.yaml")  # FluxoLinkParser
+```bash
+fluxo convert EC.fml --to mtf freeflux -o runs/               # translate only
+fluxo convert EC.fml --to mtf freeflux -o runs/ --link ec.yaml  # ... and record
+fluxo add-input ec.yaml my_EC.netw --experiment a_STAT  # hand-written input: check + aliases
+fluxo add-results ec.yaml runs/mtf/EC_a_STAT_res        # into the planned influx_si run
+fluxo compare ec.yaml                                   # every run's fluxes, by canonical id
 ```
+
+The check parses each written input back and compares it with the record.
+Differences a writer makes by design are listed apart (`expected_differences`):
+a drain for a pool nothing consumes, a sink pool as an efflux's product, an
+explicit unlabelled input for a source pool. Anything else is a difference
+(`equivalent: false`), for example the succinate symmetry or the tracer
+purity the MTF writer drops.
+
+The code lives in `link/` and needs the optional `linkml` extra
+(`uv sync --extra linkml`), except `compare`:
 
 | Module | Role |
 |--------|------|
-| `io/fluxolink_writer.py` | Model → dataset (`to_fluxo_dataset`, `dump_yaml`, `FluxoLinkWriter`) |
-| `io/fluxolink_parser.py` | Dataset → model (`from_fluxo_dataset`, `load_yaml`, `FluxoLinkParser`) |
-| `io/results/` | Tool *output* → dataset records: influx_si `<prefix>_res/`, INCA `.mat`, FreeFlux and 13CFLUX v3 result objects |
-| `io/format_conventions.py` | Format quirks shared by the parsers, writers and `equivalence` |
-| `equivalence.py` | `compare(a, b)`: do two models describe the same problem? Works without the extra |
-| `cli.py` | The `fluxo` command: `ingest`, `validate`, `compare`, `export`, `meta init` |
+| `link/record.py` | Read and write record YAML (`load_record`, `save_record`) |
+| `link/record_from_model.py` | Model → the record's model copy (`to_fluxo_dataset`) |
+| `link/model_from_record.py` | The record's model copy → model (`from_fluxo_dataset`) |
+| `link/tool_inputs.py` | Write a tool's input, check it against the record, record it (`write_tool_input`, `check_tool_input`, `record_tool_input`) |
+| `link/files.py` | One `SourceFile` per physical file, with roles and checksum |
+| `link/aliases.py` | Tool ids ↔ canonical ids (`infer_aliases`, `alias_map`) |
+| `link/runs.py` | Put a tool's results into its planned run (`add_results`) |
+| `link/results/` | Read tool output: influx_si `<prefix>_res/`, INCA `.mat`, FreeFlux and 13CFLUX v3 result objects |
+| `link/equivalence.py` | `compare(a, b)`: do two models describe the same problem? Works without the extra |
+| `io/format_conventions.py` | Format quirks shared by the parsers, writers and the link layer |
+| `cli.py` | The `fluxo` command |
 
-The writer publishes only what the source said: converter defaults (uniform
-variant weights, placeholder bounds, `scale="auto"`) are left out, and the
-parser puts them back.
+The model copy holds only what the source said: converter defaults (uniform
+variant weights, placeholder bounds, `scale="auto"`) are left out, and
+`from_fluxo_dataset` puts them back.
 
 ## INCA (MATLAB model scripts)
 

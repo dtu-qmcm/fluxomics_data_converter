@@ -3,11 +3,11 @@
 Entry point::
 
     from fluxomics_data_converter.io import parse_fluxml_file
-    from fluxomics_data_converter.io import to_fluxo_dataset, dump_yaml
+    from fluxomics_data_converter.link import save_record, to_fluxo_dataset
 
     data = parse_fluxml_file("EC.fml")
     ds = to_fluxo_dataset(data, dataset_id="ec", source_path=Path("EC.fml"))
-    dump_yaml(ds, "ec.yaml")
+    save_record(ds, "ec.yaml")
 
 Mapping rules
 -------------
@@ -27,7 +27,7 @@ the default is not published:
 - The MTF parser invents flux bounds (``-1000..1000`` for free fluxes,
   ``0..1e6`` for free pool sizes, ``lo = hi = value`` for constrained ones)
   and the FreeFlux parser sets ``lo = hi = value``. Those placeholders are
-  dropped; :func:`~.fluxolink_parser.from_fluxo_dataset` restores them.
+  dropped; :func:`~.model_from_record.from_fluxo_dataset` restores them.
 - ``Metadata.strain`` is published only inside a cultivation ``Condition``
   supplied by the metadata sidecar; the adapter never creates one.
 
@@ -51,7 +51,6 @@ source has several configurations (``EC.fml`` reuses ``fp_0`` and
 
 from __future__ import annotations
 
-import hashlib
 import re
 import warnings
 import xml.etree.ElementTree as ET
@@ -60,51 +59,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-import yaml
 from fluxolink.datamodel import fluxolink as fl
 
 from ..core.core import FluxomicsData, LabelingExperiments
 from ..experiment.measurement import Datum, Group, Measurement
-from .freeflux_parser import FreefluxParser
 from ..model.atom_mapping import AtomTransition as ConverterAtomTransition
 from ..model.constraint import ConstraintFormula, Constraints
 from ..model.reaction import Reaction
 from ..output.simulation import Simulation
-from . import format_conventions as conv
-
-#: ``InputFormatEnum`` value -> IANA media type.
-_MEDIA_TYPES = {
-    ".fml": "application/xml",
-    ".xml": "application/xml",
-    ".m": "text/x-matlab",
-    ".tsv": "text/tab-separated-values",
-    ".csv": "text/csv",
-    ".xlsx": (
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    ),
-}
-
-_MTF_ROLES = {
-    ".netw": "network",
-    ".linp": "tracer",
-    ".miso": "mid_measurements",
-    ".mflux": "flux_measurements",
-    ".mmet": "pool_size_measurements",
-    ".cnstr": "constraints",
-    ".tvar": "variable_specification",
-    ".opt": "configuration",
-}
-
-_FREEFLUX_ROLES = {
-    "reactions": "network",
-    "fluxes": "variable_specification",
-    "concentrations": "variable_specification",
-    "label_input": "tracer",
-    "flux_bounds": "constraints",
-    "measured_MDVs": "mid_measurements",
-    "measured_fluxes": "flux_measurements",
-    "measured_inst_MDVs": "mid_measurements",
-}
+from ..io import format_conventions as conv
+from .files import source_file, tool_files
 
 _STATE_SPACES = {
     "auto": "auto",
@@ -233,72 +197,6 @@ def to_fluxo_dataset(
         fields["simulation_runs"] = runs
     fields.update(sidecar.get("dataset") or {})
     return fl.FluxoDataset(**fields)
-
-
-class _IndentedDumper(yaml.SafeDumper):
-    """Safe dumper that indents block sequences under their parent key.
-
-    PyYAML writes list items flush with their parent key by default; the
-    FluxoLink repository's yamllint configuration (``indent-sequences:
-    true``) expects them indented by two spaces.
-    """
-
-    def increase_indent(
-        self, flow: bool = False, indentless: bool = False
-    ) -> None:
-        """Never emit indentless sequences."""
-        super().increase_indent(flow, False)
-
-
-def to_yaml_text(document: Dict[str, Any], header: Optional[str] = None) -> str:
-    """Render a dataset document as YAML text.
-
-    Args:
-        document: The dataset as plain data.
-        header: Optional comment block written above the document; each
-            line is prefixed with ``#``.
-
-    Returns:
-        The YAML text.
-    """
-    text = yaml.dump(
-        document,
-        Dumper=_IndentedDumper,
-        sort_keys=False,
-        allow_unicode=True,
-        width=88,
-    )
-    if header:
-        comment = "".join(
-            f"# {line}".rstrip() + "\n" for line in header.splitlines()
-        )
-        text = comment + text
-    return text
-
-
-def dump_yaml(
-    ds: fl.FluxoDataset, path: Path | str, *, header: Optional[str] = None
-) -> Path:
-    """Write a dataset as YAML, keeping only the slots that were set.
-
-    ``exclude_unset`` keeps schema ``ifabsent`` defaults (``is_pseudo:
-    false``, ``instance: 1``) out of the file, so it states only what the
-    source said.
-
-    Args:
-        ds: The dataset.
-        path: Output file; parent directories are created.
-        header: Optional comment block written above the document; each
-            line is prefixed with ``#``.
-
-    Returns:
-        The path written.
-    """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    document = ds.model_dump(mode="json", exclude_unset=True, exclude_none=True)
-    path.write_text(to_yaml_text(document, header), encoding="utf-8")
-    return path
 
 
 # -- sidecar -----------------------------------------------------------------
@@ -433,43 +331,21 @@ class _Builder:
         """
         if self.source_path is None:
             return []
-        entries: List[Tuple[Path, List[str], str]] = []
-        path = self.source_path
-        if self.fmt == conv.MTF:
-            prefix = path.with_suffix("") if path.suffix else path
-            for suffix in conv.MTF_EXTENSIONS:
-                candidate = prefix.with_suffix(suffix)
-                if candidate.exists():
-                    entries.append((candidate, [_MTF_ROLES[suffix]], conv.MTF))
-        elif self.fmt in conv.FREEFLUX_FORMATS:
-            directory = path.parent if path.is_file() else path
-            finder = FreefluxParser()
-            for kind, role in _FREEFLUX_ROLES.items():
-                found = finder._find_file(directory, kind)
-                if found is not None:
-                    entries.append(
-                        (found, [role], conv.freeflux_format(found) or self.fmt)
-                    )
-        elif path.is_file() and self.fmt is not None:
-            entries.append((path, self._single_file_roles(), self.fmt))
-
         files = []
-        for file_path, roles, fmt in entries:
-            content = file_path.read_bytes()
+        for file_path, roles, fmt in tool_files(
+            self.source_path, self.fmt, self.data
+        ):
             file_id = f"{self.dataset_id}.src.{file_path.name}"
             self.source_file_ids.append(file_id)
-            fields: Dict[str, Any] = {
-                "id": file_id,
-                "path": self._relative(file_path),
-                "format": fmt,
-                "role": roles,
-                "checksum": "sha256:" + hashlib.sha256(content).hexdigest(),
-                "file_size_bytes": len(content),
-            }
-            media = _MEDIA_TYPES.get(file_path.suffix.lower())
-            if media:
-                fields["media_type"] = media
-            files.append(fl.SourceFile(**fields))
+            files.append(
+                source_file(
+                    file_path,
+                    file_id=file_id,
+                    fmt=fmt,
+                    roles=roles,
+                    recorded_path=self._relative(file_path),
+                )
+            )
         return files
 
     def _relative(self, file_path: Path) -> str:
@@ -488,38 +364,6 @@ class _Builder:
             except ValueError:
                 pass
         return file_path.name
-
-    def _single_file_roles(self) -> List[str]:
-        """List the roles a single-file source (FluxML, INCA) plays.
-
-        Returns:
-            File roles derived from the content the model holds.
-        """
-        data = self.data
-        roles = ["network"]
-        if data.constraints or any(e.constraints for e in data.experiments):
-            roles.append("constraints")
-        if any(e.tracers for e in data.experiments):
-            roles.append("tracer")
-        models = [
-            e.measurement.model for e in data.experiments if e.measurement
-        ]
-        if any(m.labeling_measurement for m in models):
-            roles.append("mid_measurements")
-        if any(m.flux_measurement for m in models):
-            roles.append("flux_measurements")
-        if any(m.metabolitesize_measurement for m in models):
-            roles.append("pool_size_measurements")
-        if any(e.simulation for e in data.experiments):
-            roles.append("simulation")
-            if any(
-                e.simulation and e.simulation.variables
-                for e in data.experiments
-            ):
-                roles.append("variable_specification")
-        if self.fmt == conv.INCA:
-            roles.append("driver_script")
-        return roles
 
     def _time_units(self) -> Dict[str, str]:
         """Find the time unit of each configuration.
@@ -1358,52 +1202,3 @@ def _is_placeholder_bound(
     if fmt in conv.FREEFLUX_FORMATS:
         return lo == hi == value.value
     return False
-
-
-class FluxoLinkWriter:
-    """Writer for FluxoLink dataset YAML files.
-
-    Satisfies :class:`~fluxomics_data_converter.io.base.FluxomicsWriter`. A
-    dataset holds every experiment, so ``experiment_name`` is ignored, as
-    for FluxML.
-    """
-
-    def __init__(self, **dataset_options: Any):
-        """Initialise the writer.
-
-        Args:
-            **dataset_options: Keyword arguments for
-                :func:`to_fluxo_dataset` (``dataset_id``, ``source_path``,
-                ``data_origin``, ``metadata``, ...). ``dataset_id``
-                defaults to the output file's stem.
-        """
-        self.dataset_options = dataset_options
-
-    def write(
-        self,
-        model: FluxomicsData,
-        path: Path | str,
-        experiment_name: Optional[str] = None,
-    ) -> None:
-        """Write *model* as a FluxoLink dataset YAML file.
-
-        Args:
-            model: The data model to serialise.
-            path: Output ``.yaml`` file.
-            experiment_name: Ignored; every experiment is written.
-        """
-        options = {"dataset_id": Path(path).stem, **self.dataset_options}
-        dump_yaml(to_fluxo_dataset(model, **options), path)
-
-
-def write_fluxolink(
-    model: FluxomicsData, path: Path | str, **dataset_options: Any
-) -> None:
-    """Convenience function to write a FluxoLink dataset YAML file.
-
-    Args:
-        model: The data model to serialise.
-        path: Output ``.yaml`` file.
-        **dataset_options: Keyword arguments for :func:`to_fluxo_dataset`.
-    """
-    FluxoLinkWriter(**dataset_options).write(model, path)

@@ -1,4 +1,4 @@
-"""Tests for the FluxoLink results readers (influx_si, INCA, FreeFlux, x3cflux).
+"""Tests for the tool results readers (influx_si, INCA, FreeFlux, x3cflux).
 
 Every produced run is wrapped in a catalog-tier dataset and checked with
 ``fluxolink-validate`` (schema + semantic checks), which must report no
@@ -22,11 +22,11 @@ pytest.importorskip("fluxolink")
 scipy_io = pytest.importorskip("scipy.io")
 from scipy.stats import chi2  # noqa: E402
 
-from fluxomics_data_converter.io.results._common import (  # noqa: E402
+from fluxomics_data_converter.link.results._common import (  # noqa: E402
     checked_interval,
 )
-from fluxomics_data_converter.io.results import (  # noqa: E402
-    dump_dataset,
+from fluxomics_data_converter.link import save_record  # noqa: E402
+from fluxomics_data_converter.link.results import (  # noqa: E402
     from_freeflux_result,
     from_x3cflux_fit,
     parse_influx_log,
@@ -79,7 +79,7 @@ def validate(runs, tmp_path: Path) -> None:
     files = []
     for i, run in enumerate(runs):
         ds = wrap_in_dataset(run, dataset_id=f"ds{i}")
-        files.append(dump_dataset(ds, tmp_path / f"ds{i}.yaml"))
+        files.append(save_record(ds, tmp_path / f"ds{i}.yaml"))
     proc = subprocess.run(
         command + [str(f) for f in files],
         capture_output=True,
