@@ -7,7 +7,7 @@ metabolic reactions, including support for:
 - Isotopomer transformations
 """
 
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 from dataclasses import dataclass
 from pydantic import BaseModel, Field, ConfigDict
 import re
@@ -447,7 +447,9 @@ class AtomTransition(BaseModel):
 
     @staticmethod
     def parse_fluxml_cfg(
-        reactant_cfgs: Dict[str, str],
+        reactant_cfgs: Union[
+            Dict[str, str], Sequence[Tuple[str, Optional[str]]]
+        ],
         product_cfgs: List[Tuple[str, str]],
         reactant_order: List[str],
     ) -> AtomMap:
@@ -457,6 +459,14 @@ class AtomTransition(BaseModel):
         the form ``Element#atom_index@reactant_position``.  For example, the
         token ``C#3@2`` means "this product atom comes from carbon atom 3 of
         the 2nd reactant compound listed in *reactant_order*".
+
+        Tokens are symbols, as 13CFLUX reads them: a product token is
+        resolved to wherever the same token appears in the reactant cfgs.
+        With the usual identity reactant cfgs (``C#1@1 C#2@1 ...``) that is
+        the literal reading above; a reactant ``<variant>`` that permutes
+        its tokens (``C#4@1 C#3@1 C#2@1 C#1@1``) moves the source atoms
+        accordingly.  A token that appears in no reactant cfg falls back to
+        the literal reading.
 
         Example (aldolase FBP → GAP + DHAP from the FluxML spec)::
 
@@ -484,10 +494,10 @@ class AtomTransition(BaseModel):
                                                      reactant_order)
 
         Args:
-            reactant_cfgs: Mapping of ``reactant_id -> cfg_string``.
-                The cfg string is space-separated tokens, but for reactants
-                the content is informational only; the actual source positions
-                are determined by *reactant_order*.
+            reactant_cfgs: The reactant cfg strings, either as a list of
+                ``(reactant_id, cfg_or_None)`` pairs aligned with
+                *reactant_order* (needed when a compound appears twice), or
+                as a mapping ``reactant_id -> cfg_string``.
             product_cfgs: Ordered list of ``(product_id, cfg_string)`` pairs.
                 Products are processed in order; repeated compound IDs create
                 separate instances.
@@ -516,6 +526,18 @@ class AtomTransition(BaseModel):
             compound_counts[cpd] = compound_counts.get(cpd, 0) + 1
             position_to_instance[idx] = (cpd, compound_counts[cpd])
 
+        # Where each reactant token sits: token -> (position, atom index)
+        token_source: Dict[str, Tuple[int, int]] = {}
+        for idx, cpd in enumerate(reactant_order):
+            if isinstance(reactant_cfgs, dict):
+                reactant_cfg = reactant_cfgs.get(cpd)
+            elif idx < len(reactant_cfgs) and reactant_cfgs[idx][0] == cpd:
+                reactant_cfg = reactant_cfgs[idx][1]
+            else:
+                reactant_cfg = None
+            for k, tok in enumerate((reactant_cfg or "").split(), start=1):
+                token_source[tok] = (idx, k)
+
         # Track product instances
         product_instances = {}
         product_atom_indices = {}
@@ -536,8 +558,11 @@ class AtomTransition(BaseModel):
                 if not m:
                     raise ValueError(f"Bad product cfg token: {tok}")
                 atom_type = m.group(1)
-                src_atom = int(m.group(2))
-                src_reactant_idx = int(m.group(3)) - 1  # to 0-based
+                if tok in token_source:
+                    src_reactant_idx, src_atom = token_source[tok]
+                else:
+                    src_atom = int(m.group(2))
+                    src_reactant_idx = int(m.group(3)) - 1  # to 0-based
 
                 if src_reactant_idx not in position_to_instance:
                     raise IndexError(

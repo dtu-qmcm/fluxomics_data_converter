@@ -615,7 +615,10 @@ class FreefluxParser:
         - labeling_pattern: '0'=unlabeled, '1'=labeled (e.g. '010' for
           2nd-carbon label). Comma-separated list for mixtures.
         - percentage: Molar fraction [0, 1]. Comma-separated list.
-        - purity: Labeled atom purity [0, 1]. Comma-separated list.
+        - purity (optional): Labeled atom purity [0, 1]. Comma-separated
+          list. Left unset (None) when the column or cell is empty; the
+          FluxML writer treats purity and natural abundance together (see
+          :meth:`FluxMLWriter.write`).
         - label_atom (optional): Element type, default 'C'.
 
         Multiple rows for the same metabolite are merged into one Tracers
@@ -662,7 +665,7 @@ class FreefluxParser:
                 .strip("'\"")
             )
             pct_str = str(row.get(col_map.get("percentage", ""), "1.0")).strip()
-            purity_str = str(row.get(col_map.get("purity", ""), "1.0")).strip()
+            purity_str = str(row.get(col_map.get("purity", ""), "")).strip()
 
             if not pattern_str or pattern_str == "nan":
                 continue
@@ -672,22 +675,22 @@ class FreefluxParser:
             percentages = self._parse_comma_values(pct_str) or [1.0] * len(
                 patterns
             )
-            purities = self._parse_comma_values(purity_str) or [1.0] * len(
-                patterns
+            purities: List[Optional[float]] = list(
+                self._parse_comma_values(purity_str)
             )
 
             # Pad if lengths don't match
             while len(percentages) < len(patterns):
                 percentages.append(1.0)
             while len(purities) < len(patterns):
-                purities.append(1.0)
+                purities.append(None)
 
             for pattern, pct, purity in zip(patterns, percentages, purities):
                 labels_by_metabolite[metab_id].append(
                     LabelComposition(
                         labeled_pattern=pattern,
                         fraction=float(pct),
-                        purity=float(purity),
+                        purity=purity,
                     )
                 )
 

@@ -39,6 +39,8 @@ class FluxomicsParser(Protocol):
       (``parse_file`` alias kept for backward compatibility)
     - :class:`~fluxomics_data_converter.io.MTFParser`
     - :class:`~fluxomics_data_converter.io.FreefluxParser`
+    - :class:`~fluxomics_data_converter.io.INCAParser`
+    - :class:`~fluxomics_data_converter.io.FluxoLinkParser`
     """
 
     def parse(self, path: Path | str) -> FluxomicsData:
@@ -72,6 +74,7 @@ class FluxomicsWriter(Protocol):
     - :class:`~fluxomics_data_converter.io.FluxMLWriter`
     - :class:`~fluxomics_data_converter.io.MTFWriter`
     - :class:`~fluxomics_data_converter.io.FreefluxWriter`
+    - :class:`~fluxomics_data_converter.io.FluxoLinkWriter`
 
     Notes on the ``experiment_name`` parameter
     ------------------------------------------

@@ -108,6 +108,52 @@ evaluator = ConstraintEvaluator(reaction_ids, parameters={"mu": 0.03})
 constraint_fn, operator, rhs = evaluator.parse_formula("uptGLC = 1.0")
 ```
 
+## FluxoLink datasets and the `fluxo` CLI
+
+[FluxoLink](../fluxomics_linkml) is the LinkML data model built on the FLUXO
+ontology. The optional `linkml` extra connects the two projects:
+
+- FluxoLink is one more format in `fluxomics_data_converter.io`:
+  `io.fluxolink_writer` turns a parsed model into a dataset YAML and
+  `io.fluxolink_parser` reads it back (`parse("ec.yaml")` works too).
+- `fluxomics_data_converter.io.results` reads tool results into dataset
+  records: influx_si `<prefix>_res/`, INCA `.mat`, and FreeFlux and 13CFLUX v3
+  result objects.
+- `fluxomics_data_converter.equivalence.compare` checks whether two parsed
+  models describe the same 13C-MFA problem, whatever format they came from.
+  It does not need the extra.
+
+```bash
+uv sync --extra linkml
+```
+
+```bash
+fluxo meta init EC.fml -o study.yaml          # scaffold the metadata no native file carries
+fluxo ingest EC.fml --meta study.yaml --tier benchmark -o ec.yaml
+fluxo ingest model.netw --results model_res -o run1.yaml    # influx_si inputs + results
+fluxo validate ec.yaml --benchmark            # schema + references + tier rules
+fluxo compare run1.yaml run2.yaml             # flux results side by side, by reaction id
+fluxo compare a.yaml b.yaml --inputs          # do two datasets encode the same problem?
+fluxo export ec.yaml --to mtf --experiment a_STAT -o out/EC   # regenerate tool inputs
+```
+
+`fluxo ingest` validates the dataset before writing it. At the benchmark tier it
+fails, with a list of the missing fields, until the sidecar supplies what no
+native format carries.
+
+```python
+from fluxomics_data_converter.equivalence import compare
+from fluxomics_data_converter.io import (
+    dump_yaml, from_fluxo_dataset, parse_fluxml_file, to_fluxo_dataset,
+)
+
+model = parse_fluxml_file("EC.fml")
+dataset = to_fluxo_dataset(model, dataset_id="ec", source_path="EC.fml",
+                           data_origin="synthetic")
+dump_yaml(dataset, "ec.yaml")
+assert compare(model, from_fluxo_dataset(dataset)).equivalent
+```
+
 ## Project Structure
 
 ```
@@ -372,7 +418,10 @@ write_fluxml(model, "path/to/output.fml")
 
 ### 6. Command-Line Interface (CLI)
 
-**Status**: Not implemented
+**Status**: Partly implemented. `fluxo` covers the FluxoLink workflow (ingest,
+validate, compare, export, meta init); see "FluxoLink datasets and the `fluxo`
+CLI" above. A plain `convert` / `info` command without the `linkml` extra is
+still open.
 
 **Required functionality**:
 - Convert between formats from command line

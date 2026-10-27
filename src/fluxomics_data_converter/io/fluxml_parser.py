@@ -28,7 +28,7 @@ Limitations
 
 import logging
 import xml.etree.ElementTree as ET
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Tuple
 from datetime import datetime
 import re
 from itertools import product
@@ -41,6 +41,7 @@ from ..model import (
     Metabolite,
     Reaction,
     AtomTransition,
+    AtomMap,
     Variables,
     FluxValue,
     MetaboliteSizeValue,
@@ -69,6 +70,20 @@ from ..model import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def variant_combinations(lists: List[list]) -> List[tuple]:
+    """Cross product of variant lists in the order 13CFLUX enumerates it.
+
+    13CFLUX counts a reaction's variant combinations like an odometer whose
+    *first* participant (reducts in document order, then rproducts) turns
+    fastest; the i-th id of the reaction's id list names the i-th
+    combination.  ``itertools.product`` turns the last one fastest.
+
+    Returns:
+        One tuple per combination, with one element per list.
+    """
+    return [tuple(reversed(c)) for c in product(*reversed(lists))]
 
 
 class FluxMLParser:
@@ -354,215 +369,125 @@ class FluxMLParser:
         for ann_elem in reaction_elem.findall(f"{ns_prefix}annotation"):
             annotations.append(self._parse_annotation(ann_elem))
 
-        # Parse reactants
+        # Parse reactants and products, keeping each participant's cfg
+        # variants by position: [(cfg, ratio), ...] - one entry for a plain
+        # cfg attribute, none for a participant without atoms.
+        def participant_variants(
+            elem: ET.Element,
+        ) -> List[Tuple[str, Optional[float]]]:
+            variant_elems = elem.findall(f"{ns_prefix}variant")
+            if not variant_elems:
+                cfg = elem.get("cfg")
+                return [(cfg, None)] if cfg else []
+            variants = []
+            for variant_elem in variant_elems:
+                cfg = variant_elem.get("cfg")
+                ratio_str = variant_elem.get("ratio")
+                if cfg:
+                    variants.append(
+                        (cfg, float(ratio_str) if ratio_str else None)
+                    )
+            return variants
+
         reactants = []
-        reactant_cfgs = []
+        reactant_variants = []
         for reduct_elem in reaction_elem.findall(f"{ns_prefix}reduct"):
             reduct_id = reduct_elem.get("id")
             if not reduct_id:
                 raise ValueError("Reactant must have an id attribute")
             reactants.append(reduct_id)
-            cfg = reduct_elem.get("cfg")
-            if cfg:
-                reactant_cfgs.append((reduct_id, cfg))
+            reactant_variants.append(participant_variants(reduct_elem))
 
-        # Parse reactants and check for variants
         products = []
-        product_cfgs = []
-        # Store variants for products with multiple mappings
-        # Format: {product_id: [(cfg, ratio), ...]}
-        product_variants: Dict[str, List[Tuple[str, Optional[float]]]] = {}
-
+        product_variants = []
         for rproduct_elem in reaction_elem.findall(f"{ns_prefix}rproduct"):
             rproduct_id = rproduct_elem.get("id")
             if not rproduct_id:
                 raise ValueError("Product must have an id attribute")
             products.append(rproduct_id)
-
-            # Check for variant sub-elements
-            variant_elems = rproduct_elem.findall(f"{ns_prefix}variant")
-            if variant_elems:
-                # Product has multiple variants
-                variants = []
-                for variant_elem in variant_elems:
-                    cfg = variant_elem.get("cfg")
-                    ratio_str = variant_elem.get("ratio")
-                    ratio = float(ratio_str) if ratio_str else None
-                    if cfg:
-                        variants.append((cfg, ratio))
-                if variants:
-                    product_variants[rproduct_id] = variants
-                    # Use first variant as default for building base config
-                    product_cfgs.append((rproduct_id, variants[0][0]))
-            else:
-                # Single cfg attribute on product
-                cfg = rproduct_elem.get("cfg")
-                if cfg:
-                    product_cfgs.append((rproduct_id, cfg))
-
-        # Also collect reactant variants (some FluxML files put
-        # variants on reduct)
-        reactant_variants: Dict[str, List[Tuple[str, Optional[float]]]] = {}
-        for reduct_elem in reaction_elem.findall(f"{ns_prefix}reduct"):
-            reduct_id = reduct_elem.get("id")
-            variant_elems = reduct_elem.findall(f"{ns_prefix}variant")
-            if variant_elems:
-                variants = []
-                for variant_elem in variant_elems:
-                    cfg = variant_elem.get("cfg")
-                    ratio_str = variant_elem.get("ratio")
-                    ratio = float(ratio_str) if ratio_str else None
-                    if cfg:
-                        variants.append((cfg, ratio))
-                if variants:
-                    reactant_variants[reduct_id] = variants
+            product_variants.append(participant_variants(rproduct_elem))
 
         # Build atom transition if configurations exist
         atom_mapping = None
-        if product_cfgs:
-            # Build maps dict with atom_map_ids
+        if any(product_variants):
+            options = [
+                variants or [(None, None)]
+                for variants in reactant_variants + product_variants
+            ]
+            has_variants = any(len(o) > 1 for o in options)
+            if has_variants and atom_transition_ids:
+                # One combination per reaction id, in 13CFLUX's order
+                combinations = variant_combinations(options)
+                if len(atom_transition_ids) != len(combinations):
+                    base_name = atom_transition_ids[0].split("___")[0]
+                    atom_transition_ids = [
+                        f"{base_name}___{i + 1}"
+                        for i in range(len(combinations))
+                    ]
+            else:
+                combinations = [tuple(o[0] for o in options)]
+
             maps_dict = {}
             weights_dict = {}
+            n_reactants = len(reactants)
+            for variant_idx, combination in enumerate(combinations):
+                reactant_items = [
+                    (cpd, cfg)
+                    for cpd, (cfg, _) in zip(
+                        reactants, combination[:n_reactants]
+                    )
+                ]
+                product_items = [
+                    (cpd, cfg)
+                    for cpd, (cfg, _) in zip(
+                        products, combination[n_reactants:]
+                    )
+                    if cfg
+                ]
+                atom_map = self._parse_atom_map(
+                    reactant_items, product_items, reactants
+                )
+                if not atom_map:
+                    continue
+                if not (has_variants and atom_transition_ids):
+                    # Single mapping, keyed by the reaction id
+                    maps_dict[reaction_id] = atom_map
+                    continue
+                map_id = atom_transition_ids[variant_idx]
+                maps_dict[map_id] = atom_map
+                ratios = [r for _, r in combination if r is not None]
+                if ratios:
+                    weight = 1.0
+                    for ratio in ratios:
+                        weight *= ratio
+                    weights_dict[map_id] = weight
 
-            # Check if we have variants
-            if (product_variants or reactant_variants) and atom_transition_ids:
-                # Generate Cartesian product of all variant combinations
-                # Collect variant lists for both reactants and products
-                variant_compound_list = []
-
-                for rct_id in reactants:
-                    if rct_id in reactant_variants:
-                        variant_compound_list.append(
-                            ("reactant", rct_id, reactant_variants[rct_id])
-                        )
-
-                for prod_id in products:
-                    if prod_id in product_variants:
-                        variant_compound_list.append(
-                            ("product", prod_id, product_variants[prod_id])
-                        )
-
-                if variant_compound_list:
-                    # Generate all combinations using Cartesian product
-                    variant_lists = [
-                        variants for _, _, variants in variant_compound_list
-                    ]
-                    all_combinations = list(product(*variant_lists))
-
-                    # If atom_transition_ids doesn't match, derive
-                    # from base name
-                    base_name = atom_transition_ids[0].split("___")[0]
-                    expected_count = len(all_combinations)
-                    if len(atom_transition_ids) != expected_count:
-                        atom_transition_ids = [
-                            f"{base_name}___{i + 1}"
-                            for i in range(expected_count)
-                        ]
-
-                    # For each combination, create an atom map
-                    for variant_idx, combination in enumerate(all_combinations):
-                        # Build reactant/product cfgs for this combination
-                        variant_reactant_cfgs = list(reactant_cfgs)
-                        variant_product_cfgs = list(product_cfgs)
-
-                        # Map compound -> chosen variant cfg
-                        combination_weight = None
-                        for i, (side, cpd_id, _) in enumerate(
-                            variant_compound_list
-                        ):
-                            cfg, ratio = combination[i]
-                            if ratio is not None:
-                                if combination_weight is None:
-                                    combination_weight = ratio
-                                else:
-                                    combination_weight *= ratio
-
-                            if side == "reactant":
-                                variant_reactant_cfgs = [
-                                    (c, cfg) if c == cpd_id else (c, v)
-                                    for c, v in variant_reactant_cfgs
-                                ]
-                            else:
-                                variant_product_cfgs = [
-                                    (c, cfg) if c == cpd_id else (c, v)
-                                    for c, v in variant_product_cfgs
-                                ]
-
-                        # Parse based on format
-                        all_cfgs = variant_reactant_cfgs + variant_product_cfgs
-                        sample_cfg = all_cfgs[0][1] if all_cfgs else ""
-                        atom_map = None
-                        if sample_cfg and re.search(
-                            r"[A-Z]#\d+@\d+", sample_cfg
-                        ):
-                            atom_map = AtomTransition.parse_fluxml_cfg(
-                                reactant_cfgs=dict(variant_reactant_cfgs),
-                                product_cfgs=variant_product_cfgs,
-                                reactant_order=reactants,
-                            )
-                        elif sample_cfg and re.search(r"[a-zA-Z]", sample_cfg):
-                            atom_map = AtomTransition.parse_letter_notation(
-                                reactant_items=variant_reactant_cfgs,
-                                product_items=variant_product_cfgs,
-                            )
-
-                        if atom_map:
-                            map_id = atom_transition_ids[variant_idx]
-                            maps_dict[map_id] = atom_map
-                            if combination_weight is not None:
-                                weights_dict[map_id] = combination_weight
-
-                    # Normalize weights if present
-                    if weights_dict:
-                        total_weight = sum(weights_dict.values())
-                        if total_weight > 0:
-                            weights_dict = {
-                                k: v / total_weight
-                                for k, v in weights_dict.items()
-                            }
-                    else:
-                        # Use uniform weights
-                        uniform_weight = 1.0 / len(maps_dict)
+            if maps_dict and has_variants and atom_transition_ids:
+                if weights_dict:
+                    # Normalize weights
+                    total_weight = sum(weights_dict.values())
+                    if total_weight > 0:
                         weights_dict = {
-                            k: uniform_weight for k in maps_dict.keys()
+                            k: v / total_weight for k, v in weights_dict.items()
                         }
-
-                    # Create mapping with all variants
-                    if maps_dict:
-                        atom_mapping = AtomTransition(
-                            reaction_id=reaction_id,
-                            reactants=reactants,
-                            products=products,
-                            maps=maps_dict,
-                            weights=weights_dict,
-                        )
-            else:
-                # No variants, single mapping
-                sample_cfg = product_cfgs[0][1]
-                atom_map = None
-                if re.search(r"[A-Z]#\d+@\d+", sample_cfg):
-                    # C#1@2 format
-                    atom_map = AtomTransition.parse_fluxml_cfg(
-                        reactant_cfgs=dict(reactant_cfgs),
-                        product_cfgs=product_cfgs,
-                        reactant_order=reactants,
-                    )
-                elif re.search(r"[a-zA-Z]", sample_cfg):
-                    # Letter notation (abc format)
-                    atom_map = AtomTransition.parse_letter_notation(
-                        reactant_items=reactant_cfgs,
-                        product_items=product_cfgs,
-                    )
-
-                if atom_map:
-                    # Use reaction_id as the atom_map_id for single map case
-                    maps_dict = {reaction_id: atom_map}
-                    atom_mapping = AtomTransition(
-                        reaction_id=reaction_id,
-                        reactants=reactants,
-                        products=products,
-                        maps=maps_dict,
-                    )
+                else:
+                    # Use uniform weights
+                    uniform_weight = 1.0 / len(maps_dict)
+                    weights_dict = {k: uniform_weight for k in maps_dict.keys()}
+                atom_mapping = AtomTransition(
+                    reaction_id=reaction_id,
+                    reactants=reactants,
+                    products=products,
+                    maps=maps_dict,
+                    weights=weights_dict,
+                )
+            elif maps_dict:
+                atom_mapping = AtomTransition(
+                    reaction_id=reaction_id,
+                    reactants=reactants,
+                    products=products,
+                    maps=maps_dict,
+                )
 
         return Reaction(
             id=reaction_id,
@@ -573,6 +498,42 @@ class FluxMLParser:
             products=products,
             atom_transition_ids=atom_transition_ids,
         ), atom_mapping
+
+    @staticmethod
+    def _parse_atom_map(
+        reactant_items: List[Tuple[str, Optional[str]]],
+        product_items: List[Tuple[str, str]],
+        reactants: List[str],
+    ) -> Optional[AtomMap]:
+        """Parse one atom map from reactant and product cfg strings.
+
+        Args:
+            reactant_items: ``(reactant_id, cfg or None)`` per reactant, in
+                reaction order.
+            product_items: ``(product_id, cfg)`` for products with a cfg.
+            reactants: Reactant ids in reaction order.
+
+        Returns:
+            The atom map, or None if the cfgs are in neither the ``C#k@r``
+            nor the letter notation.
+        """
+        sample_cfg = next(
+            (cfg for _, cfg in reactant_items + product_items if cfg), ""
+        )
+        if re.search(r"[A-Z]#\d+@\d+", sample_cfg):
+            # C#1@2 format
+            return AtomTransition.parse_fluxml_cfg(
+                reactant_cfgs=reactant_items,
+                product_cfgs=product_items,
+                reactant_order=reactants,
+            )
+        if re.search(r"[a-zA-Z]", sample_cfg):
+            # Letter notation (abc format)
+            return AtomTransition.parse_letter_notation(
+                reactant_items=[(c, cfg) for c, cfg in reactant_items if cfg],
+                product_items=product_items,
+            )
+        return None
 
     def _parse_annotation(self, ann_elem: ET.Element) -> Annotation:
         """Parse annotation element.

@@ -4,17 +4,75 @@ FluxML is an XML-based format used by 13CFlux/13CFlux2 for 13C metabolic
 flux analysis.
 """
 
+import warnings
 import xml.etree.ElementTree as ET
+from collections import Counter, defaultdict
+from itertools import combinations
 from xml.dom import minidom
-from typing import TYPE_CHECKING, Optional, Dict
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    FrozenSet,
+    List,
+    NamedTuple,
+    Optional,
+    Tuple,
+)
 from datetime import datetime
 from pathlib import Path
 
 from ..core.core import FluxomicsData, LabelingExperiments
-from ..model.atom_mapping import AtomTransition
+from ..model.atom_mapping import AtomMap
+from .fluxml_parser import variant_combinations
 
 if TYPE_CHECKING:
     import numpy as np
+
+# An atom map with metadata stripped: product atom -> source atom, each as
+# (compound, instance, index).  Two maps are the same transition iff their
+# keys are equal.
+_MapKey = FrozenSet[Tuple[Tuple[str, int, int], Tuple[str, int, int]]]
+
+
+class _ReactionLayout(NamedTuple):
+    """How one model reaction is written as a FluxML ``<reaction>``.
+
+    ``reducts`` and ``rproducts`` hold, per participant position, the cfg
+    strings to write: none (no ``cfg``), one (a plain ``cfg`` attribute) or
+    several (a ``<variant>`` list).  ``ids`` lists the reaction ids in the
+    order 13CFLUX enumerates the variant cross product.
+    """
+
+    ids: List[str]
+    reducts: List[List[str]]
+    rproducts: List[List[str]]
+
+
+def _instance_positions(compounds: List[str]) -> Dict[Tuple[str, int], int]:
+    """Map each ``(compound, instance)`` to its 1-based position.
+
+    Returns:
+        A dict keyed like :class:`AtomAddress` ``(mol, instance)``, where
+        the instance counts repeated occurrences of the same compound.
+    """
+    seen: Dict[str, int] = {}
+    positions: Dict[Tuple[str, int], int] = {}
+    for pos, cpd in enumerate(compounds, start=1):
+        seen[cpd] = seen.get(cpd, 0) + 1
+        positions[(cpd, seen[cpd])] = pos
+    return positions
+
+
+def _map_key(atom_map: AtomMap) -> _MapKey:
+    """Strip element metadata from an atom map so maps can be compared.
+
+    Returns:
+        The map as a frozenset of ``(product atom, source atom)`` pairs.
+    """
+    return frozenset(
+        ((p.mol, p.instance, p.index), (s.mol, s.instance, s.index))
+        for p, s in atom_map.mapping.items()
+    )
 
 
 class FluxMLWriter:
@@ -23,13 +81,40 @@ class FluxMLWriter:
     Converts a :class:`~fluxomics_data_converter.FluxomicsData` into a
     pretty-printed UTF-8 XML file.
 
+    Variant reactions
+    -----------------
+    13CFLUX reads the ``<variant>`` lists of a reaction as a cross product
+    over every reduct and rproduct, and requires the reaction's id list to
+    be exactly as long as that product.  The writer therefore factorises a
+    reaction's atom maps into per-participant variants: only a participant
+    whose cfg really differs between maps gets a ``<variant>`` list (a
+    symmetric product as an rproduct variant, a symmetric substrate as a
+    reduct variant), every other participant gets a plain ``cfg``.  The id
+    list is ordered the way 13CFLUX enumerates the combinations (first
+    reduct fastest).  A reaction whose maps cannot be written as such a
+    cross product raises ``ValueError``.
+
+    Input pools and drains
+    ----------------------
+    - Every tracer becomes an ``<input>``.  A metabolite that no reaction
+      can produce (not a product, and not a reactant of a reversible
+      reaction) and that carries atoms is declared as an *unlabelled*
+      ``<input>`` in each configuration that has no tracer for it.
+    - 13CFLUX balances every pool, so a pool that is produced but never
+      consumed gets an extra irreversible ``<pool>_out`` drain reaction
+      (``add_drains=True``, the default).  Metabolites whose id ends in
+      ``_ext`` are treated as external boundary pools: they get no drain
+      and are left out of the mass balance used to fill in missing flux
+      values.
+
     Known limitations
     -----------------
     - Named constraints (``"name: expression"``) lose their name prefix on
       write; only the expression is emitted.
     - Experiment-level ``<constraints>`` sections are not written.
-    - ``<variant>`` elements for scrambling reactions do not include their
-      ``ratio`` / weight attributes.
+    - ``<variant>`` elements carry no ``ratio`` attribute, so every variant
+      combination gets the same weight; reactions with non-uniform atom-map
+      weights raise ``ValueError``.
     - Tracer ``type`` is always written as ``"isotopomer"``; the actual
       ``Tracers.type`` field value is ignored.
 
@@ -49,6 +134,12 @@ class FluxMLWriter:
         self._model: Optional[FluxomicsData] = None
         self._ns = self.NAMESPACE
         self._metabolite_atom_counts: Dict[str, int] = {}
+        self._layouts: Dict[str, _ReactionLayout] = {}
+        self._sources: List[str] = []
+        self._drains: List[str] = []
+        self._input_pools: set = set()
+        self._natural_abundance = False
+        self._add_drains = True
 
     def _compute_metabolite_atom_counts(self) -> Dict[str, int]:
         """Compute atom counts for metabolites by scanning atom transitions.
@@ -98,6 +189,8 @@ class FluxMLWriter:
         model: FluxomicsData,
         filepath: str,
         apply_na_correction: bool = False,
+        natural_abundance: bool = False,
+        add_drains: bool = True,
     ) -> None:
         """Write FluxomicsData to a FluxML file.
 
@@ -111,14 +204,42 @@ class FluxMLWriter:
                 abundance, so that x3cflux can recover unbiased flux
                 estimates.  Leave False when the data comes from real MS
                 experiments (natural abundance is already present in the
-                raw signal).
+                raw signal).  Only meaningful together with
+                ``natural_abundance=True``: without it 13CFLUX simulates
+                ideal inputs and the corrected data no longer matches.
 
                 Note: M_C is a binomial approximation.  The exact correction
                 is network-dependent; expect a residual of ~10⁻³ MID units.
+            natural_abundance: Whether 13CFLUX should give the unlabelled
+                atoms of every input pool their natural ¹³C abundance.  In
+                FluxML this is switched by the ``purity`` attribute of
+                ``<label>``: with the attribute present (even
+                ``purity="1.0"``), 13CFLUX puts ~1.1 % ¹³C on every
+                unlabelled input carbon; without it, the input is the ideal
+                isotopomer.  ``False`` (default) writes no ``purity``
+                attribute, so a label purity below 1 cannot be expressed
+                and is dropped with a warning.  ``True`` writes ``purity``
+                on every label (the tracer's purity, or 1.0 when unknown).
+            add_drains: Add an irreversible ``<pool>_out`` reaction for
+                every pool that is produced but never consumed (except
+                ``*_ext`` pools).  13CFLUX rejects a network with such a
+                pool, so turn this off only if the model already drains
+                its terminal pools.
         """
         self._model = model
         self._apply_na_correction = apply_na_correction
+        self._natural_abundance = natural_abundance
+        self._add_drains = add_drains
         filepath = Path(filepath)
+
+        if apply_na_correction and not natural_abundance:
+            warnings.warn(
+                "apply_na_correction=True adds natural abundance to the "
+                "measurements, but natural_abundance=False writes ideal "
+                "inputs, so 13CFLUX will not simulate it. Pass "
+                "natural_abundance=True as well.",
+                stacklevel=2,
+            )
 
         # Ensure output directory exists
         filepath.parent.mkdir(parents=True, exist_ok=True)
@@ -143,6 +264,18 @@ class FluxMLWriter:
 
         with open(filepath, "w", encoding="utf-8") as f:
             f.write("\n".join(cleaned_lines))
+
+    def _timestamp(self) -> str:
+        """Return the model's own date, or the current time if it has none.
+
+        Using ``metadata.date`` keeps regenerated files reproducible.
+
+        Returns:
+            The timestamp formatted as ``YYYY-MM-DD HH:MM:SS``.
+        """
+        metadata = self._model.metadata
+        date = metadata.date if metadata and metadata.date else datetime.now()
+        return date.strftime("%Y-%m-%d %H:%M:%S")
 
     def _build_fluxml(self) -> ET.Element:
         """Build the root fluxml element.
@@ -179,15 +312,8 @@ class FluxMLWriter:
 
         metadata = ET.SubElement(root, "info")
 
-        if self._model.metadata.date:
-            date_elem = ET.SubElement(metadata, "date")
-            date_elem.text = self._model.metadata.date.strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-        else:
-            # Add current timestamp
-            date_elem = ET.SubElement(metadata, "date")
-            date_elem.text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        date_elem = ET.SubElement(metadata, "date")
+        date_elem.text = self._timestamp()
 
         if self._model.metadata.comment:
             comment_elem = ET.SubElement(metadata, "comment")
@@ -201,6 +327,89 @@ class FluxMLWriter:
             strain_elem = ET.SubElement(metadata, "strain")
             strain_elem.text = self._model.metadata.strain
 
+    def _atom_count(self, metabolite_id: str) -> int:
+        """Return a metabolite's atom count, inferred from the maps if unset.
+
+        Returns:
+            The number of atoms, or 0 if unknown.
+        """
+        metabolite = next(
+            (m for m in self._model.model.metabolites if m.id == metabolite_id),
+            None,
+        )
+        if metabolite is not None and metabolite.atoms:
+            return metabolite.atoms
+        return self._metabolite_atom_counts.get(metabolite_id, 0)
+
+    def _classify_pools(self) -> None:
+        """Find the source pools, input pools and drained sink pools.
+
+        Sets ``self._sources`` (pools no reaction can produce, which become
+        unlabelled inputs unless a tracer covers them), ``self._input_pools``
+        and ``self._drains`` (pools that get an ``_out`` reaction), and
+        warns about pools 13CFLUX would reject.
+        """
+        reactions = list(self._model.model.reactions)
+        consumed: set = set()
+        produced: set = set()
+        producible: set = set()  # produced in either direction
+        for rxn in reactions:
+            consumed.update(rxn.reactants)
+            produced.update(rxn.products)
+            producible.update(rxn.products)
+            if rxn.reversibility:
+                producible.update(rxn.reactants)
+        tracer_pools = {
+            tracer.metabolite
+            for exp in self._model.experiments
+            for tracer in exp.tracers
+        }
+
+        sources = sorted(consumed - producible)
+        self._sources = [m for m in sources if self._atom_count(m) > 0]
+        self._input_pools = tracer_pools | set(self._sources)
+
+        untraced = sorted(
+            m
+            for m in self._sources
+            if any(
+                m not in {t.metabolite for t in exp.tracers}
+                for exp in self._model.experiments
+            )
+        )
+        if untraced:
+            warnings.warn(
+                f"Declared {len(untraced)} pool(s) that no reaction produces "
+                f"as unlabelled inputs: {untraced}",
+                stacklevel=4,
+            )
+
+        sinks = sorted(
+            m
+            for m in (produced - consumed - self._input_pools)
+            if not m.endswith("_ext")
+        )
+        self._drains = sinks if self._add_drains else []
+        if sinks and not self._add_drains:
+            warnings.warn(
+                f"{len(sinks)} pool(s) are produced but never consumed and "
+                f"add_drains=False, so 13CFLUX will reject the network: "
+                f"{sinks}",
+                stacklevel=4,
+            )
+
+        only_reactant = sorted(consumed - produced - self._input_pools)
+        if only_reactant:
+            warnings.warn(
+                f"{len(only_reactant)} pool(s) never appear as a reaction "
+                f"product and are not inputs, which 13CFLUX rejects (a pool "
+                f"filled only by the backward direction of reversible "
+                f"reactions, or a source without atoms): {only_reactant}. "
+                f"Write those reactions in the direction of their net flux, "
+                f"or declare the pool as an input.",
+                stacklevel=4,
+            )
+
     def _add_reaction_network(self, root: ET.Element) -> None:
         """Add reactionnetwork element."""
         rn = ET.SubElement(root, "reactionnetwork")
@@ -208,6 +417,7 @@ class FluxMLWriter:
         # Compute atom counts from atom transitions for metabolites
         # missing this info
         self._metabolite_atom_counts = self._compute_metabolite_atom_counts()
+        self._classify_pools()
 
         # Add metabolite pools
         pools = ET.SubElement(rn, "metabolitepools")
@@ -232,62 +442,33 @@ class FluxMLWriter:
                         ann_elem.text = ann.content
 
         # Add reactions
+        self._layouts = {}
         for reaction in self._model.model.reactions:
-            self._add_reaction(rn, reaction)
+            layout = self._layout_reaction(reaction)
+            self._layouts[reaction.id] = layout
+            self._add_reaction(rn, reaction, layout)
 
         # Add drain reactions for sink metabolites (produced but
         # never consumed).  13CFlux2 / x3cflux requires every output
         # metabolite to have an explicit sink reaction so the network
         # can be validated as structurally consistent.
-        consumed: set = set()
-        produced: set = set()
-        for rxn in self._model.model.reactions:
-            consumed.update(rxn.reactants)
-            produced.update(rxn.products)
-        input_pools = {
-            tracer.metabolite
-            for exp in self._model.experiments
-            for tracer in exp.tracers
-        }
-        for metab_id in sorted(
-            m
-            for m in (produced - consumed - input_pools)
-            if not m.endswith("_ext")
-        ):
+        for metab_id in self._drains:
             drain = ET.SubElement(rn, "reaction")
             drain.set("id", f"{metab_id}_out")
             drain.set("bidirectional", "false")
             reduct = ET.SubElement(drain, "reduct")
             reduct.set("id", metab_id)
-            atom_count = self._metabolite_atom_counts.get(metab_id)
-            if not atom_count:
-                m = next(
-                    (
-                        m
-                        for m in self._model.model.metabolites
-                        if m.id == metab_id
-                    ),
-                    None,
-                )
-                if m:
-                    atom_count = m.atoms
+            atom_count = self._atom_count(metab_id)
             if atom_count:
                 cfg = " ".join(f"C#{i}@1" for i in range(1, atom_count + 1))
                 reduct.set("cfg", cfg)
 
-    def _add_reaction(self, rn: ET.Element, reaction) -> None:
+    def _add_reaction(
+        self, rn: ET.Element, reaction, layout: _ReactionLayout
+    ) -> None:
         """Add a single reaction element."""
         rxn = ET.SubElement(rn, "reaction")
-
-        # Handle variant reactions
-        if (
-            reaction.atom_transition_ids
-            and len(reaction.atom_transition_ids) > 1
-        ):
-            # Multiple variants - use space-separated IDs
-            rxn.set("id", " ".join(reaction.atom_transition_ids))
-        else:
-            rxn.set("id", reaction.id)
+        rxn.set("id", " ".join(layout.ids))
 
         # Reversibility (FluxML default is bidirectional=true)
         if not reaction.reversibility:
@@ -301,182 +482,312 @@ class FluxMLWriter:
                 if ann.content:
                     ann_elem.text = ann.content
 
-        # Get atom transition if exists
-        atom_mapping = self._model.model.atom_mappings.get(reaction.id)
+        for tag, compounds, cfg_lists in (
+            ("reduct", reaction.reactants, layout.reducts),
+            ("rproduct", reaction.products, layout.rproducts),
+        ):
+            for compound_id, cfgs in zip(compounds, cfg_lists):
+                elem = ET.SubElement(rxn, tag)
+                elem.set("id", compound_id)
+                if len(cfgs) == 1:
+                    elem.set("cfg", cfgs[0])
+                elif len(cfgs) > 1:
+                    for cfg in cfgs:
+                        ET.SubElement(elem, "variant").set("cfg", cfg)
 
-        # Add reactants
-        for i, reactant_id in enumerate(reaction.reactants):
-            reduct = ET.SubElement(rxn, "reduct")
-            reduct.set("id", reactant_id)
+    def _layout_reaction(self, reaction) -> _ReactionLayout:
+        """Work out a reaction's ids and per-participant cfg strings.
 
-            # Add cfg if atom transition exists
-            if atom_mapping:
-                cfg = self._build_reactant_cfg(atom_mapping, reactant_id, i)
-                if cfg:
-                    reduct.set("cfg", cfg)
+        The atom maps of a reaction are factorised into per-participant
+        variants relative to the first map: a map that differs from it only
+        in one product's atoms gives that product a variant, one that
+        differs only in which atoms of one reactant are used gives that
+        reactant a (relabelling) variant.  The smallest set of such
+        participants whose cross product reproduces the maps - with their
+        multiplicities if possible, else their weights - is written.
 
-        # Add products
-        if reaction.products:
-            # Check if this reaction has variants (multiple atom maps)
-            has_variants = atom_mapping and len(atom_mapping.maps) > 1
-
-            for i, product_id in enumerate(reaction.products):
-                rproduct = ET.SubElement(rxn, "rproduct")
-                rproduct.set("id", product_id)
-
-                if atom_mapping:
-                    if has_variants:
-                        # Add variant elements for each mapping
-                        self._add_product_variants(
-                            rproduct, atom_mapping, product_id, i
-                        )
-                    else:
-                        # Single mapping - add cfg attribute
-                        cfg = self._build_product_cfg(
-                            atom_mapping, product_id, i
-                        )
-                        if cfg:
-                            rproduct.set("cfg", cfg)
-
-    def _build_reactant_cfg(
-        self,
-        atom_mapping: AtomTransition,
-        cpd_id: str,
-        position: int,
-    ) -> Optional[str]:
-        """Build FluxML cfg string for a reactant.
+        Cfg tokens are ``E#k@r``: atom ``k`` of the reactant at position
+        ``r``.  13CFLUX only matches tokens between the reduct and the
+        rproduct side, so a reduct variant is a permutation of its tokens.
 
         Returns:
-            The cfg string, or None if no atom mapping exists.
+            The reaction's :class:`_ReactionLayout`.
+
+        Raises:
+            ValueError: If the reaction's atom maps are not a cross product
+                of per-participant variants, which FluxML cannot express.
         """
-        if not atom_mapping.maps:
-            return None
+        reducts: List[List[str]] = [[] for _ in reaction.reactants]
+        rproducts: List[List[str]] = [[] for _ in reaction.products]
+        mapping = self._model.model.atom_mappings.get(reaction.id)
+        if not mapping or not mapping.maps:
+            self._fill_efflux_cfgs(reaction, reducts, rproducts)
+            return _ReactionLayout([reaction.id], reducts, rproducts)
 
-        # Get the first atom map (for reactants, all variants should
-        # have same reactant atoms)
-        atom_map = next(iter(atom_mapping.maps.values()))
+        r_pos = _instance_positions(reaction.reactants)
+        p_pos = _instance_positions(reaction.products)
+        r_at = {pos: key for key, pos in r_pos.items()}
+        p_at = {pos: key for key, pos in p_pos.items()}
+        maps = list(mapping.maps.items())
 
-        # Find all atoms that come from this reactant
-        instance = 1  # Track instance (for repeated compounds)
+        # Element of every reactant atom used by any map
+        elements: Dict[int, Dict[int, str]] = defaultdict(dict)
+        for _, atom_map in maps:
+            for src in atom_map.mapping.values():
+                pos = r_pos.get((src.mol, src.instance))
+                if pos is not None:
+                    elements[pos].setdefault(src.index, src.element or "C")
 
-        # Count how many times this compound appears before this position
-        compound_count = 0
-        for i, r_id in enumerate(atom_mapping.reactants):
-            if r_id == cpd_id:
-                compound_count += 1
-                if i == position:
-                    instance = compound_count
-                    break
+        def symbol(pos: int, index: int) -> str:
+            return f"{elements[pos].get(index, 'C')}#{index}@{pos}"
 
-        # Collect source atoms for this reactant instance
-        max_atom = 0
-        for src_addr in atom_map.mapping.values():
-            if src_addr.mol == cpd_id and src_addr.instance == instance:
-                max_atom = max(max_atom, src_addr.index)
+        def product_cfg(atom_map: AtomMap, slot: int) -> str:
+            tokens = []
+            for prod, src in atom_map.mapping.items():
+                if p_pos.get((prod.mol, prod.instance)) != slot:
+                    continue
+                pos = r_pos.get((src.mol, src.instance))
+                if pos is not None:
+                    tokens.append((prod.index, symbol(pos, src.index)))
+            return " ".join(token for _, token in sorted(tokens))
 
-        if max_atom == 0:
-            return None
-
-        # Build cfg string like "C#1@1 C#2@1 C#3@1"
-        cfg_parts = []
-        for atom_idx in range(1, max_atom + 1):
-            # Find this atom in the mapping values to get element type
-            element = "C"  # Default to carbon
-            for prod_addr, src_addr in atom_map.mapping.items():
-                if (
-                    src_addr.mol == cpd_id
-                    and src_addr.instance == instance
-                    and src_addr.index == atom_idx
-                ):
-                    element = src_addr.element or "C"
-                    break
-            cfg_parts.append(f"{element}#{atom_idx}@{position + 1}")
-
-        return " ".join(cfg_parts) if cfg_parts else None
-
-    def _build_product_cfg(
-        self,
-        atom_mapping: AtomTransition,
-        cpd_id: str,
-        position: int,
-        atom_map_id: Optional[str] = None,
-    ) -> Optional[str]:
-        """Build FluxML cfg string for a product.
-
-        Returns:
-            The cfg string, or None if no atom mapping exists.
-        """
-        if not atom_mapping.maps:
-            return None
-
-        # Select which atom map to use
-        if atom_map_id:
-            atom_map = atom_mapping.maps.get(atom_map_id)
-        else:
-            atom_map = next(iter(atom_mapping.maps.values()))
-
-        if not atom_map:
-            return None
-
-        # Count instance for this product
-        instance = 1
-        compound_count = 0
-        for i, p_id in enumerate(atom_mapping.products):
-            if p_id == cpd_id:
-                compound_count += 1
-                if i == position:
-                    instance = compound_count
-                    break
-
-        # Build position lookup for reactants
-        reactant_position = {}
-        instance_counts: Dict[str, int] = {}
-        for pos, r_id in enumerate(atom_mapping.reactants, start=1):
-            instance_counts[r_id] = instance_counts.get(r_id, 0) + 1
-            inst = instance_counts[r_id]
-            reactant_position[(r_id, inst)] = pos
-
-        # Collect product atoms for this compound instance
-        atoms = []
-        for prod_addr, src_addr in atom_map.mapping.items():
-            if prod_addr.mol == cpd_id and prod_addr.instance == instance:
-                src_pos = reactant_position.get(
-                    (src_addr.mol, src_addr.instance)
-                )
-                if src_pos is not None:
-                    element = prod_addr.element or "C"
-                    atoms.append(
-                        (prod_addr.index, element, src_addr.index, src_pos)
-                    )
-
-        if not atoms:
-            return None
-
-        # Sort by product atom index and build cfg string
-        atoms.sort(key=lambda x: x[0])
-        cfg_parts = [
-            f"{elem}#{src_idx}@{src_pos}" for _, elem, src_idx, src_pos in atoms
-        ]
-
-        return " ".join(cfg_parts)
-
-    def _add_product_variants(
-        self,
-        rproduct: ET.Element,
-        atom_mapping: AtomTransition,
-        cpd_id: str,
-        position: int,
-    ) -> None:
-        """Add variant elements for a product with multiple mappings."""
-        for map_id, atom_map in atom_mapping.maps.items():
-            variant = ET.SubElement(rproduct, "variant")
-
-            # Build cfg for this variant
-            cfg = self._build_product_cfg(
-                atom_mapping, cpd_id, position, atom_map_id=map_id
+        base_id, base = maps[0]
+        base_red = {
+            pos: " ".join(symbol(pos, i) for i in range(1, max(atoms) + 1))
+            for pos, atoms in elements.items()
+        }
+        base_prod = {
+            slot: cfg for slot in p_at if (cfg := product_cfg(base, slot))
+        }
+        product_atoms = {
+            slot: sorted(
+                p.index
+                for p in base.mapping
+                if p_pos.get((p.mol, p.instance)) == slot
             )
-            if cfg:
-                variant.set("cfg", cfg)
+            for slot in base_prod
+        }
+
+        def resolve(
+            red: Dict[int, str], prod: Dict[int, str]
+        ) -> Optional[_MapKey]:
+            """Read an atom map back from cfgs, by matching tokens."""
+            where = {}
+            for pos, cfg in red.items():
+                mol, inst = r_at[pos]
+                for k, token in enumerate(cfg.split(), start=1):
+                    where[token] = (mol, inst, k)
+            pairs = []
+            for slot, cfg in prod.items():
+                mol, inst = p_at[slot]
+                tokens = cfg.split()
+                if len(tokens) != len(product_atoms[slot]):
+                    return None
+                for index, token in zip(product_atoms[slot], tokens):
+                    if token not in where:
+                        return None
+                    pairs.append(((mol, inst, index), where[token]))
+            return frozenset(pairs)
+
+        def layout(red: Dict[int, List[str]], prod: Dict[int, List[str]]):
+            return (
+                [red.get(pos, []) for pos in range(1, len(reducts) + 1)],
+                [prod.get(slot, []) for slot in range(1, len(rproducts) + 1)],
+            )
+
+        keys = {map_id: _map_key(atom_map) for map_id, atom_map in maps}
+        if (
+            len(set(keys.values())) == 1
+            or resolve(base_red, base_prod) != keys[base_id]
+        ):
+            # One distinct transition (or one these cfgs cannot express):
+            # write the first map as plain cfgs under the reaction id.
+            if len(set(keys.values())) > 1:
+                raise ValueError(
+                    f"Reaction {reaction.id!r}: its atom maps cannot be "
+                    f"written as FluxML cfg strings."
+                )
+            red, prod = layout(
+                {pos: [cfg] for pos, cfg in base_red.items()},
+                {slot: [cfg] for slot, cfg in base_prod.items()},
+            )
+            return _ReactionLayout([reaction.id], red, prod)
+
+        # Candidate variants per participant: (0, slot) for a product,
+        # (1, position) for a reactant; the base cfg comes first.
+        candidates: Dict[Tuple[int, int], List[str]] = {}
+
+        def add(part: Tuple[int, int], cfg: str, base_cfg: str) -> None:
+            known = candidates.setdefault(part, [base_cfg])
+            if cfg not in known:
+                known.append(cfg)
+
+        b = base.mapping
+        for map_id, atom_map in maps[1:]:
+            m = atom_map.mapping
+            if m.keys() != b.keys():
+                continue
+            diff = [x for x in b if m[x] != b[x]]
+            if not diff:
+                continue
+
+            slots = {p_pos.get((x.mol, x.instance)) for x in diff}
+            if len(slots) == 1 and None not in slots:
+                slot = slots.pop()
+                if slot in base_prod:
+                    cfg = product_cfg(atom_map, slot)
+                    if (
+                        resolve(base_red, {**base_prod, slot: cfg})
+                        == keys[map_id]
+                    ):
+                        add((0, slot), cfg, base_prod[slot])
+
+            sources = {r_pos.get((b[x].mol, b[x].instance)) for x in diff}
+            sources |= {r_pos.get((m[x].mol, m[x].instance)) for x in diff}
+            if len(sources) == 1 and None not in sources:
+                pos = sources.pop()
+                cfg = self._relabelled_reduct(
+                    [(b[x].index, m[x].index) for x in diff],
+                    len(base_red[pos].split()),
+                    lambda i, pos=pos: symbol(pos, i),
+                )
+                if (
+                    cfg
+                    and resolve({**base_red, pos: cfg}, base_prod)
+                    == keys[map_id]
+                ):
+                    add((1, pos), cfg, base_red[pos])
+
+        # Target: the maps' transitions with their multiplicities/weights
+        target = Counter(keys.values())
+        weights = mapping.weights or {}
+        target_weight: Dict[_MapKey, float] = defaultdict(float)
+        for map_id, _ in maps:
+            target_weight[keys[map_id]] += weights.get(map_id, 1.0)
+        total = sum(target_weight.values())
+        uniform = len({round(weights.get(i, 1.0), 12) for i, _ in maps}) == 1
+
+        parts = sorted(candidates)  # products first, then reactants
+        exact = by_weight = None
+        for size in range(len(parts) + 1):
+            for subset in sorted(
+                combinations(parts, size), key=lambda s: sum(p[0] for p in s)
+            ):
+                red = {
+                    pos: candidates[(1, pos)] if (1, pos) in subset else [cfg]
+                    for pos, cfg in base_red.items()
+                }
+                prod = {
+                    slot: (
+                        candidates[(0, slot)] if (0, slot) in subset else [cfg]
+                    )
+                    for slot, cfg in base_prod.items()
+                }
+                order = [(1, pos) for pos in sorted(red)] + [
+                    (0, slot) for slot in sorted(prod)
+                ]
+                lists = [red[i] if side else prod[i] for side, i in order]
+                combos = variant_combinations(lists)
+                if len(combos) > 4096:
+                    continue
+                combo_keys = []
+                for combo in combos:
+                    chosen = dict(zip(order, combo))
+                    combo_keys.append(
+                        resolve(
+                            {p: chosen[(1, p)] for p in red},
+                            {s: chosen[(0, s)] for s in prod},
+                        )
+                    )
+                if exact is None and uniform and Counter(combo_keys) == target:
+                    exact = (red, prod, combo_keys)
+                if by_weight is None:
+                    counts = Counter(combo_keys)
+                    if counts.keys() == target_weight.keys() and all(
+                        abs(counts[k] / len(combo_keys) - w / total) < 1e-9
+                        for k, w in target_weight.items()
+                    ):
+                        by_weight = (red, prod, combo_keys)
+            if exact:
+                break
+
+        if exact:
+            red, prod, combo_keys = exact
+            unused: Dict[_MapKey, List[str]] = defaultdict(list)
+            for map_id, _ in maps:
+                unused[keys[map_id]].append(map_id)
+            ids = [unused[k].pop(0) for k in combo_keys]
+        elif by_weight:
+            red, prod, combo_keys = by_weight
+            ids = [
+                f"{reaction.id}___{i}" for i in range(1, len(combo_keys) + 1)
+            ]
+        else:
+            raise ValueError(
+                f"Reaction {reaction.id!r}: its {len(maps)} atom maps are not "
+                f"a cross product of per-participant variants with equal "
+                f"weights, which is the only kind of alternative mapping "
+                f"FluxML can express."
+            )
+        if len(ids) == 1:
+            ids = [reaction.id]
+        red_lists, prod_lists = layout(red, prod)
+        return _ReactionLayout(ids, red_lists, prod_lists)
+
+    @staticmethod
+    def _relabelled_reduct(
+        moves: List[Tuple[int, int]], n_atoms: int, symbol
+    ) -> Optional[str]:
+        """Build the cfg of a reduct whose atoms are relabelled.
+
+        Args:
+            moves: ``(atom index in the base map, atom index in the
+                variant)`` for every product atom whose source moved.
+            n_atoms: Number of atoms of the reactant.
+            symbol: Function giving the cfg token of an atom index.
+
+        Returns:
+            The reduct cfg string, or None if *moves* is not part of a
+            permutation of the reactant's atoms.
+        """
+        perm: Dict[int, int] = {}
+        for source, target in moves:
+            if perm.setdefault(source, target) != target:
+                return None
+        if len(set(perm.values())) != len(perm):
+            return None
+        if any(not 1 <= i <= n_atoms for i in list(perm) + list(perm.values())):
+            return None
+        rest_dom = [i for i in range(1, n_atoms + 1) if i not in perm]
+        rest_rng = set(range(1, n_atoms + 1)) - set(perm.values())
+        for i in [i for i in rest_dom if i in rest_rng]:
+            perm[i] = i
+        rest_dom = [i for i in rest_dom if i not in perm]
+        rest_rng = sorted(rest_rng - set(perm.values()))
+        perm.update(zip(rest_dom, rest_rng))
+        inverse = {target: source for source, target in perm.items()}
+        return " ".join(symbol(inverse[k]) for k in range(1, n_atoms + 1))
+
+    def _fill_efflux_cfgs(
+        self,
+        reaction,
+        reducts: List[List[str]],
+        rproducts: List[List[str]],
+    ) -> None:
+        """Give the reducts of an efflux reaction a cfg.
+
+        A reaction with no product atoms (an efflux in FluxML) has no atom
+        map, but 13CFLUX still requires a ``cfg`` on every reduct that has
+        atoms.  Its atoms go nowhere, so any unique labelling will do.
+        """
+        if any(self._atom_count(p) for p in reaction.products):
+            return
+        for pos, reactant_id in enumerate(reaction.reactants, start=1):
+            n_atoms = self._atom_count(reactant_id)
+            if n_atoms:
+                reducts[pos - 1] = [
+                    " ".join(f"C#{i}@{pos}" for i in range(1, n_atoms + 1))
+                ]
 
     def _add_constraints(self, root: ET.Element) -> None:
         """Add constraints element."""
@@ -525,13 +836,25 @@ class FluxMLWriter:
 
     def _add_experiments(self, root: ET.Element) -> None:
         """Add configuration elements for experiments."""
+        dropped: List[str] = []
         for experiment in self._model.experiments:
-            self._add_experiment(root, experiment)
+            dropped += self._add_experiment(root, experiment)
+        if dropped:
+            warnings.warn(
+                f"Label purity below 1 dropped for {dropped}: FluxML can "
+                f"only express purity together with natural abundance. "
+                f"Pass natural_abundance=True to keep it.",
+                stacklevel=4,
+            )
 
     def _add_experiment(
         self, root: ET.Element, experiment: LabelingExperiments
-    ) -> None:
-        """Add a single configuration/experiment element."""
+    ) -> List[str]:
+        """Add a single configuration/experiment element.
+
+        Returns:
+            Descriptions of label purities that could not be written.
+        """
         config = ET.SubElement(root, "configuration")
         config.set("name", experiment.name)
         config.set("stationary", "true" if experiment.stationary else "false")
@@ -539,9 +862,14 @@ class FluxMLWriter:
         if experiment.time is not None:
             config.set("time", str(experiment.time))
 
-        # Add tracer inputs
+        # Add tracer inputs, then an unlabelled input for every other source
+        dropped: List[str] = []
         for tracer in experiment.tracers:
-            self._add_tracer_input(config, tracer)
+            dropped += self._add_tracer_input(config, tracer)
+        traced = {tracer.metabolite for tracer in experiment.tracers}
+        for metabolite_id in self._sources:
+            if metabolite_id not in traced:
+                self._add_unlabelled_input(config, metabolite_id)
 
         # Add measurement section
         if experiment.measurement:
@@ -550,130 +878,237 @@ class FluxMLWriter:
         # Add simulation section
         if experiment.simulation:
             self._add_simulation(config, experiment)
+        return dropped
 
     def _add_simulation(
         self, config: ET.Element, experiment: LabelingExperiments
     ) -> None:
         """Add simulation element with flux and pool-size initial values.
 
-        Writes stored simulation values (F-type fluxes) then solves S·v=0
-        to derive values for any reactions not yet listed — this covers:
-        - D-type reactions from MTF parsing (E_out, F_out with no stored value)
-        - Auto-generated drain reactions for sink metabolites (freeflux source)
-        """
-        import numpy as np
+        Writes the stored simulation values, then derives net values for
+        reactions that have none - D-type reactions from MTF parsing and
+        the auto-generated ``_out`` drains - from the steady-state mass
+        balance S·v = 0.  Only values that the stored ones determine
+        uniquely are written; see :meth:`_derive_net_fluxes`.
 
+        A flux stored under the id of a variant reaction is split evenly
+        over its variant ids (``SCS`` -> ``SCS___1``, ``SCS___2``), which is
+        what 13CFLUX's own constraints between variants require.
+        """
         sim = ET.SubElement(config, "simulation")
         sim.set("method", "auto")
         sim.set("type", "full")
 
         variables = ET.SubElement(sim, "variables")
-        stored_ids: set = set()
-        for fv in experiment.simulation.variables.flux_values:
+        stored = experiment.simulation.variables
+        flux_values = stored.flux_values if stored else []
+
+        reactions = list(self._model.model.reactions)
+        ids_of = {r.id: self._layouts[r.id].ids for r in reactions}
+        variant_of = {
+            variant_id: rxn_id
+            for rxn_id, ids in ids_of.items()
+            if len(ids) > 1
+            for variant_id in ids
+        }
+        drain_ids = [f"{m}_out" for m in self._drains]
+        known = set(ids_of) | set(variant_of) | set(drain_ids)
+
+        def emit(flux_id: str, flux_type: str, value: float) -> None:
+            fv_elem = ET.SubElement(variables, "fluxvalue")
+            fv_elem.set("flux", flux_id)
+            fv_elem.set("type", flux_type)
+            fv_elem.text = str(value)
+
+        net_known: Dict[str, float] = {}
+        unknown: List[str] = []
+        for fv in flux_values:
             # Skip D-type fluxes with no stored value (influx_si MTF parsing
             # produces these; they must be derived from mass balance instead).
             if fv.value is None:
                 continue
-            fv_elem = ET.SubElement(variables, "fluxvalue")
-            fv_elem.set("flux", fv.flux)
-            fv_elem.set("type", fv.type or "net")
-            fv_elem.text = str(fv.value)
-            stored_ids.add(fv.flux)
+            # MTF free/constrained/dependent (F/C/D) values are all net
+            flux_type = fv.type if fv.type in ("net", "xch") else "net"
+            ids = ids_of.get(fv.flux, [fv.flux])
+            for flux_id in ids:
+                emit(flux_id, flux_type, fv.value / len(ids))
+            if fv.flux not in known:
+                unknown.append(fv.flux)
+            if flux_type != "net":
+                continue
+            if fv.flux in variant_of:
+                # One variant of a reaction: 13CFLUX ties the others to it
+                rxn_id = variant_of[fv.flux]
+                net_known.setdefault(rxn_id, fv.value * len(ids_of[rxn_id]))
+            else:
+                net_known[fv.flux] = fv.value
+        if unknown:
+            warnings.warn(
+                f"<fluxvalue> names that are not reaction ids in the written "
+                f"network: {sorted(set(unknown))}",
+                stacklevel=5,
+            )
 
-        # Build the full reaction list: model reactions + auto-generated drains.
-        # "Auto-generated drains" are for sink metabolites not already consumed
-        # by any existing model reaction (and not _ext external boundaries).
-        reactions = list(self._model.model.reactions)
-        consumed: set = set()
-        produced: set = set()
-        for rxn in reactions:
-            consumed.update(rxn.reactants)
-            produced.update(rxn.products)
-        input_pools = {
-            t.metabolite for exp in self._model.experiments for t in exp.tracers
-        }
-        sink_mets = sorted(
-            m
-            for m in (produced - consumed - input_pools)
-            if not m.endswith("_ext")
-        )
-        new_drain_ids = [f"{m}_out" for m in sink_mets]
-
-        # Collect ALL reaction IDs (model + new drains) that need a
-        # value written.
-        rxn_names = [r.id for r in reactions]
-        all_names = rxn_names + new_drain_ids  # new drains appended at end
-        missing = [n for n in all_names if n not in stored_ids]
-
+        columns = [r.id for r in reactions] + drain_ids
+        missing = [c for c in columns if c not in net_known]
         if missing:
-            metabolites = list(self._model.model.metabolites)
-            met_idx = {m.id: i for i, m in enumerate(metabolites)}
-            n_rxn = len(rxn_names)
-
-            S = np.zeros((len(metabolites), len(all_names)))
-            for j, rxn in enumerate(reactions):
-                for mid in rxn.reactants:
-                    if mid in met_idx:
-                        S[met_idx[mid], j] -= 1.0
-                for mid in rxn.products:
-                    if mid in met_idx:
-                        S[met_idx[mid], j] += 1.0
-            for k, mid in enumerate(sink_mets):
-                if mid in met_idx:
-                    S[met_idx[mid], n_rxn + k] -= 1.0
-
-            int_rows = [
-                i
-                for i, m in enumerate(metabolites)
-                if m.id not in input_pools and not m.id.endswith("_ext")
-            ]
-            S_int = S[int_rows, :]
-
-            stored_vals = {
-                fv.flux: (fv.value or 0.0)
-                for fv in experiment.simulation.variables.flux_values
-            }
-            f_names = [n for n in all_names if n in stored_ids]
-            d_names = [n for n in all_names if n not in stored_ids]
-            f_cols = [i for i, n in enumerate(all_names) if n in stored_ids]
-            d_cols = [i for i, n in enumerate(all_names) if n not in stored_ids]
-
-            derived: dict = {}
-            if d_cols:
-                v_f = np.array([stored_vals.get(n, 0.0) for n in f_names])
-                try:
-                    v_d, *_ = np.linalg.lstsq(
-                        S_int[:, d_cols], -S_int[:, f_cols] @ v_f, rcond=None
-                    )
-                    derived = {
-                        d_names[i]: float(v_d[i]) for i in range(len(d_cols))
-                    }
-                except Exception:
-                    derived = {n: 0.0 for n in d_names}
-
+            derived = self._derive_net_fluxes(columns, net_known, missing)
             for rxn_id in missing:
-                fv_elem = ET.SubElement(variables, "fluxvalue")
-                fv_elem.set("flux", rxn_id)
-                fv_elem.set("type", "net")
-                fv_elem.text = str(derived.get(rxn_id, 0.0))
+                if rxn_id not in derived:
+                    continue
+                ids = ids_of.get(rxn_id, [rxn_id])
+                for flux_id in ids:
+                    emit(flux_id, "net", derived[rxn_id] / len(ids))
 
-        for pv in experiment.simulation.variables.metabolitesize_values:
+        for pv in stored.metabolitesize_values if stored else []:
             pv_elem = ET.SubElement(variables, "poolvalue")
             pv_elem.set("pool", pv.metabolite)
             pv_elem.text = str(pv.value)
 
-    def _add_tracer_input(self, config: ET.Element, tracer) -> None:
-        """Add input element for tracer specification."""
+    def _derive_net_fluxes(
+        self,
+        columns: List[str],
+        net_known: Dict[str, float],
+        missing: List[str],
+    ) -> Dict[str, float]:
+        """Solve the steady-state mass balance for the missing net fluxes.
+
+        Input pools and ``*_ext`` pools are not balanced.  A missing flux is
+        derived only if the known fluxes determine it uniquely (it has no
+        component in the null space of the balance restricted to the
+        missing fluxes); the others are left out of the file, with a
+        warning, rather than given an arbitrary least-squares value.
+
+        Args:
+            columns: Model reaction ids followed by drain reaction ids.
+            net_known: Net flux of every reaction that has a stored value.
+            missing: Columns without a stored value.
+
+        Returns:
+            Derived net flux per determined column.
+
+        Raises:
+            ValueError: If a derived flux is negative on an irreversible
+                reaction (the stored flux map contradicts the network).
+        """
+        import numpy as np
+
+        reactions = list(self._model.model.reactions)
+        metabolites = list(self._model.model.metabolites)
+        met_idx = {m.id: i for i, m in enumerate(metabolites)}
+        col_idx = {c: j for j, c in enumerate(columns)}
+
+        S = np.zeros((len(metabolites), len(columns)))
+        for j, rxn in enumerate(reactions):
+            for mid in rxn.reactants:
+                if mid in met_idx:
+                    S[met_idx[mid], j] -= 1.0
+            for mid in rxn.products:
+                if mid in met_idx:
+                    S[met_idx[mid], j] += 1.0
+        for metab_id in self._drains:
+            if metab_id in met_idx:
+                S[met_idx[metab_id], col_idx[f"{metab_id}_out"]] -= 1.0
+
+        rows = [
+            i
+            for i, m in enumerate(metabolites)
+            if m.id not in self._input_pools and not m.id.endswith("_ext")
+        ]
+        known_cols = [c for c in columns if c in net_known]
+        A = S[np.ix_(rows, [col_idx[c] for c in missing])]
+        rhs = -S[np.ix_(rows, [col_idx[c] for c in known_cols])] @ np.array(
+            [net_known[c] for c in known_cols]
+        )
+
+        scale = max([1.0] + [abs(v) for v in net_known.values()])
+        if A.shape[0] == 0:
+            undetermined = list(missing)
+            solution = np.zeros(len(missing))
+        else:
+            solution, *_ = np.linalg.lstsq(A, rhs, rcond=None)
+            _, s, vt = np.linalg.svd(A)
+            tol = max(A.shape) * np.finfo(float).eps * (s[0] if s.size else 0)
+            null_space = vt[int((s > tol).sum()) :]
+            undetermined = [
+                c
+                for i, c in enumerate(missing)
+                if null_space.size and np.abs(null_space[:, i]).max() > 1e-8
+            ]
+            residual = np.abs(A @ solution - rhs).max() if rhs.size else 0.0
+            if residual > 1e-6 * scale:
+                warnings.warn(
+                    f"The stored net fluxes do not balance (largest residual "
+                    f"{residual:.3g}); derived fluxes are least-squares "
+                    f"estimates.",
+                    stacklevel=6,
+                )
+
+        if undetermined:
+            warnings.warn(
+                f"{len(undetermined)} net flux(es) have no stored value and "
+                f"are not determined by the stored ones, so no value is "
+                f"written for them: {undetermined}",
+                stacklevel=6,
+            )
+        derived = {
+            c: float(v)
+            for c, v in zip(missing, solution)
+            if c not in undetermined
+        }
+
+        irreversible = {r.id for r in reactions if not r.reversibility}
+        irreversible.update(f"{m}_out" for m in self._drains)
+        negative = {
+            c: round(v, 6)
+            for c, v in derived.items()
+            if c in irreversible and v < -1e-9 * scale
+        }
+        if negative:
+            raise ValueError(
+                f"Derived net flux is negative on irreversible reaction(s) "
+                f"{negative}: the stored flux values contradict the "
+                f"reaction directions. Provide a complete, consistent flux "
+                f"map."
+            )
+        return derived
+
+    def _add_tracer_input(self, config: ET.Element, tracer) -> List[str]:
+        """Add input element for tracer specification.
+
+        Returns:
+            Descriptions of label purities that could not be written.
+        """
         input_elem = ET.SubElement(config, "input")
         input_elem.set("pool", tracer.metabolite)
         input_elem.set("type", "isotopomer")
 
+        dropped = []
         for label in tracer.labels:
             label_elem = ET.SubElement(input_elem, "label")
             label_elem.set("cfg", label.labeled_pattern)
-            if hasattr(label, "purity") and label.purity:
-                label_elem.set("purity", str(label.purity))
+            purity = getattr(label, "purity", None)
+            if self._natural_abundance:
+                label_elem.set("purity", str(1.0 if purity is None else purity))
+            elif purity is not None and purity < 1.0:
+                dropped.append(
+                    f"{tracer.metabolite}[{label.labeled_pattern}]={purity}"
+                )
             label_elem.text = str(label.fraction)
+        return dropped
+
+    def _add_unlabelled_input(
+        self, config: ET.Element, metabolite_id: str
+    ) -> None:
+        """Add an unlabelled isotopomer input for a source pool."""
+        input_elem = ET.SubElement(config, "input")
+        input_elem.set("pool", metabolite_id)
+        input_elem.set("type", "isotopomer")
+        label_elem = ET.SubElement(input_elem, "label")
+        label_elem.set("cfg", "0" * self._atom_count(metabolite_id))
+        if self._natural_abundance:
+            label_elem.set("purity", "1.0")
+        label_elem.text = "1.0"
 
     def _add_measurement(
         self, config: ET.Element, experiment: LabelingExperiments
@@ -684,7 +1119,7 @@ class FluxMLWriter:
         # Add mlabel with metadata
         mlabel = ET.SubElement(meas_elem, "mlabel")
         date_elem = ET.SubElement(mlabel, "date")
-        date_elem.text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        date_elem.text = self._timestamp()
 
         # Check if this is time-course data
         if experiment.measurement.data and experiment.measurement.data.data:
@@ -722,7 +1157,7 @@ class FluxMLWriter:
             # Add dlabel
             dlabel = ET.SubElement(data_elem, "dlabel")
             date_elem = ET.SubElement(dlabel, "date")
-            date_elem.text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            date_elem.text = self._timestamp()
 
             # Add data points
             for datum in experiment.measurement.data.data:
@@ -857,6 +1292,8 @@ def write_fluxml(
     model: FluxomicsData,
     filepath: str,
     apply_na_correction: bool = False,
+    natural_abundance: bool = False,
+    add_drains: bool = True,
 ) -> None:
     """Convenience function to write FluxomicsData to a FluxML file.
 
@@ -866,7 +1303,20 @@ def write_fluxml(
         apply_na_correction: Apply ¹³C natural abundance
             correction (p=0.01109/C) to all MS measurement data.
             Use when data is synthetic (no NA present) and the
-            target tool is x3cflux (which models NA internally).
+            target tool is x3cflux, together with
+            ``natural_abundance=True``.
+        natural_abundance: Write the ``purity`` attribute on every input
+            label, which makes 13CFLUX give unlabelled input atoms their
+            natural ¹³C abundance.  Default False: ideal inputs, no
+            ``purity`` attribute.  See :meth:`FluxMLWriter.write`.
+        add_drains: Add a ``<pool>_out`` reaction for every pool that is
+            produced but never consumed (default True).
     """
     writer = FluxMLWriter()
-    writer.write(model, filepath, apply_na_correction=apply_na_correction)
+    writer.write(
+        model,
+        filepath,
+        apply_na_correction=apply_na_correction,
+        natural_abundance=natural_abundance,
+        add_drains=add_drains,
+    )

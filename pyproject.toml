@@ -20,6 +20,17 @@ authors = [
 ]
 license = {text = "MIT"}
 
+[project.scripts]
+# Needs the `linkml` extra (FluxoLink) for every command.
+fluxo = "fluxomics_data_converter.cli:main"
+
+[project.optional-dependencies]
+# FluxoLink (LinkML) datasets: io.fluxolink_parser/_writer, io.results, the fluxo CLI
+linkml = ["fluxolink"]
+
+[tool.uv.sources]
+fluxolink = { path = "../fluxomics_linkml", editable = true }
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
