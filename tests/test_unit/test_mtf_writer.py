@@ -9,7 +9,6 @@ from fluxomics_data_converter.io import (
     parse_mtf,
     write_mtf,
     parse_fluxml_file,
-    write_fluxml,
     parse_freeflux,
 )
 from fluxomics_data_converter.core.core import FluxomicsData
@@ -30,10 +29,7 @@ MTF_TOY = (
     / "toy"
 )
 FREEFLUX_TOY = (
-    Path(__file__).parent.parent.parent
-    / "data"
-    / "freeflux_tests"
-    / "toy"
+    Path(__file__).parent.parent.parent / "data" / "freeflux_tests" / "toy"
 )
 SIMPLE_MODEL_FML = (
     Path(__file__).parent.parent.parent
@@ -117,9 +113,7 @@ class TestMTFWriter:
 
         m = MetabolicNetworkModel(
             metabolites=[Metabolite(id="A"), Metabolite(id="B")],
-            reactions=[
-                Reaction(id="r1", reactants=["A"], products=["B"])
-            ],
+            reactions=[Reaction(id="r1", reactants=["A"], products=["B"])],
         )
         dm = FluxomicsData(
             model=m,
@@ -148,9 +142,7 @@ class TestMTFWriterFromFluxML:
     def test_fluxml_to_mtf(self, temp_dir):
         model = parse_fluxml_file(str(SIMPLE_MODEL_FML))
         base = temp_dir / "output"
-        exp_name = (
-            model.experiments[0].name if model.experiments else None
-        )
+        exp_name = model.experiments[0].name if model.experiments else None
         write_mtf(model, str(base), experiment_name=exp_name)
         assert base.with_suffix(".netw").exists()
 
@@ -171,9 +163,7 @@ class TestMTFWriterFromFreeflux:
     def test_freeflux_to_mtf(self, temp_dir):
         model = parse_freeflux(FREEFLUX_TOY)
         base = temp_dir / "output"
-        exp_name = (
-            model.experiments[0].name if model.experiments else None
-        )
+        exp_name = model.experiments[0].name if model.experiments else None
         write_mtf(model, str(base), experiment_name=exp_name)
         assert base.with_suffix(".netw").exists()
 

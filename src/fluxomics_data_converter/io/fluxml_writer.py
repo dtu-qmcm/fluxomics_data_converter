@@ -571,7 +571,11 @@ class FluxMLWriter:
         def resolve(
             red: Dict[int, str], prod: Dict[int, str]
         ) -> Optional[_MapKey]:
-            """Read an atom map back from cfgs, by matching tokens."""
+            """Read an atom map back from cfgs, by matching tokens.
+
+            Returns:
+                The map, or ``None`` if the cfgs do not determine one.
+            """
             where = {}
             for pos, cfg in red.items():
                 mol, inst = r_at[pos]

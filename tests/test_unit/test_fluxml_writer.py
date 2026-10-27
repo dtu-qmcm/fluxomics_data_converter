@@ -9,10 +9,8 @@ from fluxomics_data_converter.io import (
     parse_fluxml_file,
     write_fluxml,
     parse_mtf,
-    write_mtf,
     parse_freeflux,
 )
-from fluxomics_data_converter.core.core import FluxomicsData
 
 
 SIMPLE_MODEL_FML = (
@@ -30,10 +28,7 @@ SIMPLE_MODEL_MTF = (
     / "simple_model"
 )
 FREEFLUX_TOY = (
-    Path(__file__).parent.parent.parent
-    / "data"
-    / "freeflux_tests"
-    / "toy"
+    Path(__file__).parent.parent.parent / "data" / "freeflux_tests" / "toy"
 )
 EC_BENCHMARK = (
     Path(__file__).parent.parent.parent
@@ -149,12 +144,8 @@ class TestFluxMLWriter:
         write_fluxml(original, str(out))
         converted = parse_fluxml_file(str(out))
 
-        orig_tracers = {
-            t.metabolite for t in original.experiments[0].tracers
-        }
-        conv_tracers = {
-            t.metabolite for t in converted.experiments[0].tracers
-        }
+        orig_tracers = {t.metabolite for t in original.experiments[0].tracers}
+        conv_tracers = {t.metabolite for t in converted.experiments[0].tracers}
         assert orig_tracers == conv_tracers
 
     @pytest.mark.skipif(
@@ -247,9 +238,7 @@ class TestFluxMLRoundTrip:
         out = temp_dir / "roundtrip.fml"
         write_fluxml(original, str(out))
         converted = parse_fluxml_file(str(out))
-        assert len(converted.model.reactions) == len(
-            original.model.reactions
-        )
+        assert len(converted.model.reactions) == len(original.model.reactions)
 
     @pytest.mark.skipif(
         not SIMPLE_MODEL_FML.exists(),
@@ -260,10 +249,7 @@ class TestFluxMLRoundTrip:
         out = temp_dir / "roundtrip.fml"
         write_fluxml(original, str(out))
         converted = parse_fluxml_file(str(out))
-        assert (
-            converted.experiments[0].name
-            == original.experiments[0].name
-        )
+        assert converted.experiments[0].name == original.experiments[0].name
 
     @pytest.mark.skipif(
         not EC_BENCHMARK.exists(), reason="EC benchmark FML not found"

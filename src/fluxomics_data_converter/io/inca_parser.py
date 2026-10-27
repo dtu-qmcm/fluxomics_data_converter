@@ -256,7 +256,7 @@ class INCAParser:
                 reaction equation is malformed, or if a value vector length
                 contradicts the network (which would mean values attach to
                 the wrong reactions or metabolites).
-        """
+        """  # noqa: DOC502 - the ValueErrors come from the helpers it calls
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(f"INCA script not found: {path}")
@@ -831,6 +831,9 @@ class INCAParser:
         Returns:
             A tuple of the atom transitions keyed by reaction identifier and
             the variant identifiers for reactions a symmetry expanded.
+
+        Raises:
+            ValueError: If a reaction's atom mapping is not a bijection.
         """
         symmetries: Dict[str, Dict[int, int]] = record.get("sym", {})
         transitions = AtomTransitionsNetwork()
@@ -1335,15 +1338,15 @@ def parse_inca(path: Path | str) -> FluxomicsData:
         A fully validated
         :class:`~fluxomics_data_converter.FluxomicsData`.
 
-    Raises:
-        FileNotFoundError: If *path* does not exist.
-        ValueError: If the script is not an INCA model script or its value
-            vectors contradict the network.
-
     Example::
 
         from fluxomics_data_converter.io import parse_inca
 
         model = parse_inca("data/benchmark/INCA/EC.m")
-    """
+
+    Raises:
+        FileNotFoundError: If *path* does not exist.
+        ValueError: If the script is not an INCA model script or its value
+            vectors contradict the network.
+    """  # noqa: DOC502 - raised by INCAParser.parse
     return INCAParser().parse(path)

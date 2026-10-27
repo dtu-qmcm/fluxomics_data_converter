@@ -82,9 +82,7 @@ class TestFluxMLParserReactions:
     def test_reaction_ids(self):
         model = parse_fluxml_file(str(SIMPLE_MODEL))
         ids = list(model.model.reactions.ids)
-        assert ids == [
-            "R1", "R2", "R3", "R4", "R5", "R6", "E_out", "F_out"
-        ]
+        assert ids == ["R1", "R2", "R3", "R4", "R5", "R6", "E_out", "F_out"]
 
     @pytest.mark.skipif(
         not SIMPLE_MODEL.exists(), reason="Simple model FML not found"
@@ -238,9 +236,7 @@ class TestFluxMLParserExperiments:
         data = exp.measurement.data.data
         assert len(data) == 5
 
-        f_m0 = next(
-            d for d in data if d.id == "F_123" and d.weight == "0"
-        )
+        f_m0 = next(d for d in data if d.id == "F_123" and d.weight == "0")
         assert f_m0.value == pytest.approx(6.14943422e-05)
 
         r1_datum = next(d for d in data if d.id == "R1")
