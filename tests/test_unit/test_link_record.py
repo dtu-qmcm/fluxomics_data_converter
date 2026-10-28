@@ -65,14 +65,8 @@ REPO = Path(__file__).parent.parent.parent
 DATA = REPO / "data"
 FLUXML = DATA / "benchmark" / "FluxML"
 EC_FML = FLUXML / "EC.fml"
-SCHEMA = (
-    REPO.parent
-    / "fluxomics_linkml"
-    / "src"
-    / "fluxolink"
-    / "schema"
-    / "fluxolink.yaml"
-)
+# The schema of the installed (pinned) fluxolink package.
+SCHEMA = Path(fl.__file__).parents[1] / "schema" / "fluxolink.yaml"
 
 #: Sidecar used for the published EC benchmark dataset.
 EC_SIDECAR = {
