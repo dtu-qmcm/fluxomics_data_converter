@@ -122,6 +122,16 @@ tool's results (see [docs/formats.md](docs/formats.md)). This lives in
 uv sync --extra linkml
 ```
 
+The schema package comes from one pinned commit of
+[fluxomics_linkml](https://github.com/dtu-qmcm/fluxomics_linkml)
+(`[tool.uv.sources]` in `pyproject.toml`), so every checkout and CI run uses
+the same schema. Move the pin when the converter needs a newer schema. To try
+a local schema checkout without moving it:
+
+```bash
+uv run --with-editable ../fluxomics_linkml pytest
+```
+
 ```bash
 fluxo convert EC.fml --to mtf freeflux -o runs/       # translate, nothing else
 fluxo meta init EC.fml -o study.yaml          # scaffold the metadata no native file carries

@@ -29,7 +29,11 @@ fluxo = "fluxomics_data_converter.cli:main"
 linkml = ["fluxolink"]
 
 [tool.uv.sources]
-fluxolink = { path = "../fluxomics_linkml", editable = true }
+# The FluxoLink schema package, pinned to one commit of its GitHub repository
+# so every checkout and CI run gets the same schema. Move the pin when the
+# converter needs a newer schema. To try a local schema checkout without
+# moving it: uv run --with-editable ../fluxomics_linkml pytest
+fluxolink = { git = "https://github.com/dtu-qmcm/fluxomics_linkml", rev = "d9c0be01f1770d31804c18b37799ca67b96e8976" }
 
 [build-system]
 requires = ["hatchling"]
